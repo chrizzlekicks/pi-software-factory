@@ -12,9 +12,8 @@ RUN pi install npm:pi-subagents@0.88.0
 WORKDIR /opt/factory
 COPY --chown=node:node package.json README.md COMPATIBILITY.md ./
 COPY --chown=node:node src ./src
-COPY --chown=node:node scripts ./scripts
 COPY --chown=node:node test ./test
-COPY --chown=node:node docker/Dockerfile docker/entrypoint.sh ./docker/
+COPY --chown=node:node docker/Dockerfile docker/entrypoint.sh docker/live-smoke.mjs docker/probe-events.mjs ./docker/
 COPY --chown=node:node .dockerignore ./.dockerignore
 ENTRYPOINT ["/usr/local/bin/factory-entrypoint"]
 CMD ["test"]

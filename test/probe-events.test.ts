@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import { strict as assert } from 'node:assert';
-import { decodeProbeEvent } from '../scripts/probe-events.mjs';
+import { decodeProbeEvent } from '../docker/probe-events.mjs';
 
 test('probe decoding accepts only tagged RPC notifications', () => {
   const message = 'pi-factory-live:' + JSON.stringify({ probe: 'preflight', ok: true });

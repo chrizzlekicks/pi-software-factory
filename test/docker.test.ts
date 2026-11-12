@@ -29,10 +29,10 @@ test('default mode invokes npm test and does not require credentials', () => {
 test('image includes Docker test fixtures and uses legacy-compatible COPY', () => {
   const ignore = readFileSync('.dockerignore', 'utf8');
   const dockerfile = readFileSync('docker/Dockerfile', 'utf8');
-  for (const file of ['.dockerignore', 'docker/', 'docker/Dockerfile', 'docker/entrypoint.sh']) {
+  for (const file of ['.dockerignore', 'docker/', 'docker/Dockerfile', 'docker/entrypoint.sh', 'docker/live-smoke.mjs', 'docker/probe-events.mjs']) {
     assert.ok(ignore.split('\n').includes(`!${file}`), `build context must include ${file}`);
   }
-  assert.match(dockerfile, /^COPY --chown=node:node docker\/Dockerfile docker\/entrypoint\.sh \.\/docker\/$/m);
+  assert.match(dockerfile, /^COPY --chown=node:node docker\/Dockerfile docker\/entrypoint\.sh docker\/live-smoke\.mjs docker\/probe-events\.mjs \.\/docker\/$/m);
   assert.match(dockerfile, /^COPY --chown=node:node \.dockerignore \.\/\.dockerignore$/m);
   assert.doesNotMatch(dockerfile, /^COPY\s+--chmod(?:=|\s)/m);
   assert.match(dockerfile, /^RUN chmod 755 \/usr\/local\/bin\/factory-entrypoint$/m);

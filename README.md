@@ -1,15 +1,39 @@
 # Pi Software Factory
 
-**Safe offline Docker test rig:** [setup and usage](docker/README.md). Latest validation: 41/41 host tests and 41/41 offline-container tests passed; legacy Docker builder verified.
+Pi Software Factory is a Pi extension for an approval-gated, sequential implementation workflow that can deliver a draft GitHub pull request. Version 0.1 plans a request, implements it in a separate worktree, and independently verifies and reviews the result before delivery.
 
-A Pi extension for an approval-gated, sequential implementation and draft PR workflow. Requires Node 24, Git, GitHub CLI, a separately installed and loaded compatible pi-subagents extension, configured/authenticated models and the `ponytail-review` skill. Install this directory as a Pi package or load `/absolute/path/to/src/index.ts` with `pi -e` (for example, `pi -e /absolute/path/to/src/index.ts`). `PI_FACTORY_SUBAGENTS_PATH` can point to the installed pi-subagents package directory. Start on a clean checkout of the GitHub default branch with write access; preflight refuses missing requirements.
+## Prerequisites
 
-Use `/factory <request>` (or `/factory request <request>`) to produce a read-only plan, inspect its paths and executable/argv verification commands, then `/factory approve` or `/factory reject`. Approval starts work in a separate factory worktree. `/factory status`, `/factory inspect`, and `/factory report` show progress and local evidence. `/factory pause` stops at the next boundary; `/factory resume` continues a paused, approved run. `/factory cancel` requests cancellation and preserves artifacts. Approvals authorize the plan's commands and paths; review them carefully.
+- Node.js 24 or newer, Git, and authenticated GitHub CLI (`gh`).
+- A compatible Pi coding agent and separately installed and loaded pi-subagents extension, with configured and authenticated models. The `scout`, `worker`, `test-runner`, `reviewer`, and `docs-auditor` agents and `ponytail-review` skill must be available.
+- A clean checkout of the GitHub default branch, a supported github.com origin, and write access to the repository. Preflight checks the requirements before work begins.
 
-Each mutation is checkpointed, tested independently, reviewed by three agents, triaged, repaired at most twice, and reverified after documentation changes. Only a passing final revision is pushed to a new factory branch and opened as a draft PR. The original checkout is not stashed or cleaned. State, lock, report and worktree are under the Git common directory's `pi-factory` directory; logs can contain secrets.
+See [compatibility](COMPATIBILITY.md) for tested versions and integration limits. Set `PI_FACTORY_SUBAGENTS_PATH` to the installed pi-subagents package directory if package resolution cannot find it.
 
-Interrupted operations and uncertain delivery block automatic replay. First independently confirm all child processes have stopped and inspect the worktree, branch, GitHub branch and PR. A stale `writer.lock` must only be removed after confirming no writer or child remains. For an interrupted agent with an existing worktree and no delivery intent, `/factory recover inspected` creates a new plan requiring explicit approval. Uncertain worktree creation or delivery requires manual reconciliation; do not delete artifacts or blindly retry. There is no automated delivery reconciliation.
+## Install and use
 
-Scope checks detect Git-visible changes, not all filesystem or network effects: agents and approved commands are not OS-sandboxed, and symlinks or malicious commands may write outside the worktree. Use only trusted agents, commands and repositories. This is not a substitute for human PR review. The local `pi-factory:phase` event reports persisted factory phases; factory state remains authoritative. Berger is optional and display-only: when its executable is available, a best-effort mapping emits coarse factory states as Pi lifecycle events. Exact factory phases remain on the local `pi-factory:phase` event; persisted state remains authoritative.
+Install this directory as a Pi package, or load the extension explicitly from your repository checkout:
 
-Latest independent test-runner run: 41/41 host tests and 41/41 offline-container tests passed. A separate native Pi standalone read-only reviewer smoke passed before Docker work. Native in-container model calls/authentication and real GitHub integration remain untested; no real push was authorized. Full pipeline tests use fake agents and GitHub CLI with a real disposable Git repository and local bare remote. The live probe does not run factory delivery or GitHub CLI and can incur model usage.
+```sh
+pi -e /absolute/path/to/pi-software-factory/src/index.ts
+```
+
+In Pi, submit a request with `/factory <request>` (or `/factory request <request>`). The planner produces a read-only plan with allowed paths and executable/argv verification commands. Inspect it carefully, then use `/factory approve` or `/factory reject`. Approval authorizes the plan's paths and commands, including eventual remote delivery; it is required before the extension can push.
+
+After approval, the factory implements sequentially in a separate worktree, checkpoints changes, runs independent tests and three reviews, and triages findings. It permits at most two repair cycles and re-verifies documentation changes. Only a passing final revision can be pushed to a new factory branch and opened as a draft PR. Human PR review is still required.
+
+## Controls and recovery
+
+- `/factory status`, `/factory inspect`, and `/factory report` show progress, persisted state, and evidence.
+- `/factory pause` requests a stop at the next safe boundary; `/factory resume` continues a paused approved run. `/factory cancel` requests cancellation and preserves artifacts.
+- For an interrupted agent with an existing worktree and no delivery intent, first confirm all child processes have stopped and inspect the worktree, then use `/factory recover inspected` to create a new plan requiring approval.
+
+Interrupted operations and uncertain delivery block automatic replay. Inspect the worktree, local and GitHub branches, and PR before acting. Remove a stale `writer.lock` only after confirming no writer or child remains. Uncertain worktree creation or delivery requires manual reconciliation; do not delete artifacts or blindly retry. There is no automated delivery reconciliation.
+
+## Safety and scope
+
+The original checkout is not stashed or cleaned. State, locks, reports, and worktrees live under the Git common directory's `pi-factory` directory; logs can contain secrets. Scope checks detect Git-visible changes, not every filesystem or network effect. Agents and approved commands are not OS-sandboxed, and symlinks or malicious commands can write outside the worktree. Use trusted agents, commands, and repositories.
+
+The local `pi-factory:phase` event reports persisted phases. Optional Berger integration is best-effort and display-only; persisted factory state remains authoritative.
+
+For offline tests, live-smoke setup, and validation details, see the [Docker test rig](docker/README.md).

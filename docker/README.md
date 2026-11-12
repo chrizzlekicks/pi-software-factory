@@ -1,6 +1,6 @@
 # Docker test rig
 
-Validated: 41/41 host tests and 41/41 tests in the offline container passed. The legacy Docker builder path was verified. The image runs as nonroot uid 1000; a new named volume is writable and persists after container removal. Entrypoint mode guards were verified. Native in-container model calls/authentication and real GitHub integration remain untested.
+Validated: 41/41 host tests and 41/41 tests in the offline container passed. The legacy Docker builder path was verified. The image runs as nonroot uid 1000; a new named volume is writable and persists after container removal. Entrypoint mode guards were verified. A native Pi standalone read-only reviewer smoke passed before Docker work. Native in-container model calls/authentication and actual GitHub draft delivery remain untested; no real push was authorized.
 
 Build from the project directory (build needs network access):
 
@@ -12,9 +12,11 @@ docker run --rm --network none -v pi-factory-work:/workspace pi-factory-test
 
 The default runs the full `npm test` suite, including fake agents, real disposable Git repositories and fake `gh`. It exits with the test status; no model, GitHub credential or runtime network is required. The regression tests are part of that suite. Run them through the dedicated test-runner. No actual GitHub delivery is tested.
 
-The image installs Node 24, Pi 1.5.2 and pi-subagents 0.88.0; the latter is installed with Pi's package manager, including its built-in agents, skills and prompts. To update, check `COMPATIBILITY.md`, update the exact versions in the Dockerfile together, rebuild, and independently run the tests and live smoke. The context is allowlisted; do not put secrets in the included source files. Nothing copies host Pi settings or auth during build.
+The image installs Node 24, Pi 1.5.2 and pi-subagents 0.88.0; the latter is installed with Pi's package manager, including its built-in agents, skills and prompts. To update, check [compatibility](../COMPATIBILITY.md), update the exact versions in the Dockerfile together, rebuild, and independently run the tests and live smoke. The context is allowlisted; do not put secrets in the included source files. Nothing copies host Pi settings or auth during build.
 
 ## Read-only live smoke
+
+From a configured standalone host shell, `npm run smoke:live` runs the same probe. It refuses `PI_SUBAGENT_CHILD=1` and does not modify inherited capability, security, budget, depth, or model settings. Run it from the project root; it can incur model usage and does not run factory delivery or GitHub CLI.
 
 Mount only the two existing agent definitions and the installed review skill, plus optional Pi auth. The copies go into the container's ephemeral home; host files remain read-only. The mounted definitions retain their model assignments; built-in agents use container defaults. Host pi-subagents `agentOverrides`, `defaultModel`, and `defaultProvider` settings are not copied, so built-in agents may use different models; check availability and authentication before running. The smoke makes real model calls and can incur charges, but does not invoke GitHub delivery. Do not pass a GitHub token.
 
@@ -45,7 +47,7 @@ docker run -it --rm --network bridge -v pi-factory-work:/workspace \
   pi-factory-test live
 ```
 
-The URL must be a plain HTTPS github.com owner/repository URL. All four Git author/committer identity variables shown above must be set in your shell before running; the container does not inherit your host Git identity. Live mode configures `gh` as Git credential helper in the ephemeral home before cloning; the token must have the required repository access. In Pi use `/factory <request>`, inspect the plan, then explicitly `/factory approve` only if authorized. See the project README for recovery and approval semantics.
+The URL must be a plain HTTPS github.com owner/repository URL. All four Git author/committer identity variables shown above must be set in your shell before running; the container does not inherit your host Git identity. Live mode configures `gh` as Git credential helper in the ephemeral home before cloning; the token must have the required repository access. In Pi use `/factory <request>`, inspect the plan, then explicitly `/factory approve` only if authorized. See the [project README](../README.md) for recovery and approval semantics.
 
 `/workspace/repo` is an independent clone including its own `.git`; factory worktrees, state and reports live beneath that Git directory, on the named volume. Reusing a volume with a different origin is refused rather than overwritten. Docker initializes a **new empty named volume** from the image-owned `/workspace`, making it writable by the nonroot `node` user without runtime chown. Existing volumes, bind mounts, user-namespace remapping, and host-mounted directories may have incompatible ownership; use a new named volume rather than changing ownership of host files. `--rm` removes the container, not the named volume; delete the volume only after preserving needed artifacts. Logs and reports may contain secrets.
 

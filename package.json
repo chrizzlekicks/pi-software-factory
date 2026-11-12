@@ -13,6 +13,6 @@
   },
   "scripts": {
     "test": "node --test test/*.test.ts",
-    "smoke:live": "node scripts/live-smoke.mjs"
+    "smoke:live": "node docker/live-smoke.mjs"
   }
 }
