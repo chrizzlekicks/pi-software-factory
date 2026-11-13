@@ -1,9 +1,14 @@
-import { createRequire } from "node:module";
 import { randomUUID } from "node:crypto";
+import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { join } from "node:path";
+
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+
 import type { Agents } from "./controller.ts";
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  value !== null && typeof value === "object";
 
 const object = (properties: Record<string, unknown>, required = Object.keys(properties)) => ({
   type: "object",
@@ -88,6 +93,7 @@ export async function loadSubagents(hostModules: Record<string, unknown>) {
     throw new Error(
       "Compatible pi-subagents installation unavailable; set PI_FACTORY_SUBAGENTS_PATH to its package directory. " +
         String(e),
+      { cause: e },
     );
   }
 }
@@ -112,7 +118,9 @@ export class PiAgents implements Agents {
 
   private ceiling(role: string) {
     const r = roles[role];
-    if (!r) throw new Error("Unknown factory role");
+    if (!r) {
+      throw new Error("Unknown factory role");
+    }
     return this.api.ceiling.registerSubagentCapabilityCeiling({
       sessionId: this.ctx.sessionManager.getSessionId(),
       source: "pi-factory:" + role,
@@ -130,6 +138,9 @@ export class PiAgents implements Agents {
 
   private async contract(role: string, cwd: string) {
     const r = roles[role];
+    if (!r) {
+      throw new Error("Unknown factory role");
+    }
     const result = await this.api.preflight.resolveSubagentLaunchContract({
       agent: r.agent,
       task: "Factory preflight",
@@ -150,7 +161,9 @@ export class PiAgents implements Agents {
         this.ctx.sessionManager.getSessionId(),
       ),
     });
-    if (!result.ok) throw new Error(`Required ${role}/${r.agent} unavailable: ${result.message}`);
+    if (!result.ok) {
+      throw new Error(`Required ${role}/${r.agent} unavailable: ${result.message}`);
+    }
     if (
       !result.contract.model ||
       !this.ctx.modelRegistry
@@ -160,21 +173,24 @@ export class PiAgents implements Agents {
             `${m.provider}/${m.id}` ===
             result.contract.model.replace(/:(?:off|minimal|low|medium|high|xhigh|max)$/, ""),
         )
-    )
+    ) {
       throw new Error(
         `Required authenticated model unavailable for ${r.agent}: ${result.contract.model ?? "unresolved"}`,
       );
+    }
     if (
       r.skill &&
       !result.contract.skills.resolved.some((s: { name: string }) => s.name === r.skill)
-    )
+    ) {
       throw new Error("Required skill unavailable: " + r.skill);
+    }
     if (r.readOnly) {
       const unexpected = result.contract.tools.effectiveAllowlist.filter(
         (t: string) => !["read", "grep", "find", "ls", "structured_output"].includes(t),
       );
-      if (unexpected.length)
+      if (unexpected.length) {
         throw new Error(`Cannot enforce read-only agent tools: ${unexpected.join(", ")}`);
+      }
     }
     return result.contract;
   }
@@ -182,22 +198,29 @@ export class PiAgents implements Agents {
   private async ownerReady() {
     const requestId = randomUUID();
     await new Promise<void>((resolve, reject) => {
-      const off = this.pi.events.on(`subagents:rpc:v1:reply:${requestId}`, (reply: any) => {
+      const off = this.pi.events.on(`subagents:rpc:v1:reply:${requestId}`, (reply: unknown) => {
+        if (!isRecord(reply)) {
+          return;
+        }
         if (
           reply?.version !== 1 ||
           reply.requestId !== requestId ||
           (reply.method && reply.method !== "ping")
-        )
+        ) {
           return;
+        }
         clearTimeout(timer);
         off();
-        if (reply.success === true && reply.data?.version === 1) resolve();
-        else
+        if (reply.success === true && isRecord(reply.data) && reply.data.version === 1) {
+          resolve();
+        } else {
           reject(
             new Error(
-              "pi-subagents owner ping failed: " + (reply.error?.message ?? "invalid reply"),
+              "pi-subagents owner ping failed: " +
+                ((isRecord(reply.error) ? reply.error.message : undefined) ?? "invalid reply"),
             ),
           );
+        }
       });
       const timer = setTimeout(() => {
         off();
@@ -227,6 +250,7 @@ export class PiAgents implements Agents {
     for (const role of Object.keys(roles)) {
       const ceiling = this.ceiling(role);
       try {
+        // oxlint-disable-next-line no-await-in-loop -- Dispose each role's temporary capability ceiling before configuring the next.
         await this.contract(role, cwd);
       } finally {
         ceiling.dispose();
@@ -243,37 +267,53 @@ export class PiAgents implements Agents {
   ) {
     await this.ownerReady();
     const r = roles[role];
+    if (!r) {
+      throw new Error("Unknown factory role");
+    }
     const ceiling = this.ceiling(role);
     try {
       await this.contract(role, cwd);
-      if (signal?.aborted) throw new Error("Cancelled before delegation");
+      if (signal?.aborted) {
+        throw new Error("Cancelled before delegation");
+      }
       const d = this.api.delegation;
       return await new Promise((resolve, reject) => {
         let settled = false;
-        const match = (p: any) =>
-          p?.requestId === identity.requestId &&
+        const match = (p: unknown): p is Record<string, unknown> =>
+          isRecord(p) &&
+          p.requestId === identity.requestId &&
           p?.ownerRunId === identity.ownerRunId &&
           p?.nodeId === identity.nodeId;
         const finish = (error?: Error, value?: unknown) => {
-          if (settled) return;
+          if (settled) {
+            return;
+          }
           settled = true;
           clearTimeout(timer);
           off();
           offUpdate();
           signal?.removeEventListener("abort", cancel);
-          error ? reject(error) : resolve(value);
+          if (error) {
+            reject(error);
+          } else {
+            resolve(value);
+          }
         };
-        const off = this.pi.events.on(d.SUBAGENT_DELEGATION_RESPONSE_EVENT, (p: any) => {
-          if (!match(p)) return;
-          if (p.status !== "completed" || p.result?.kind !== "structured")
+        const off = this.pi.events.on(d.SUBAGENT_DELEGATION_RESPONSE_EVENT, (p: unknown) => {
+          if (!match(p)) {
+            return;
+          }
+          if (p.status !== "completed" || !isRecord(p.result) || p.result.kind !== "structured") {
             finish(new Error(`Agent ${role}: ${p.status}: ${p.error ?? "no structured result"}`));
-          else {
+          } else {
             this.progress(p);
             finish(undefined, p.result.value);
           }
         });
-        const offUpdate = this.pi.events.on(d.SUBAGENT_DELEGATION_UPDATE_EVENT, (p: any) => {
-          if (match(p)) this.progress(p);
+        const offUpdate = this.pi.events.on(d.SUBAGENT_DELEGATION_UPDATE_EVENT, (p: unknown) => {
+          if (match(p)) {
+            this.progress(p);
+          }
         });
         // Cancellation is acknowledged only by the package terminal response, never by this signal.
         const cancel = () => this.pi.events.emit(d.SUBAGENT_DELEGATION_CANCEL_EVENT, identity);
@@ -298,7 +338,9 @@ export class PiAgents implements Agents {
           artifacts: true,
           result: { kind: "structured", schema: r.schema },
         });
-        if (signal?.aborted) cancel();
+        if (signal?.aborted) {
+          cancel();
+        }
       });
     } finally {
       ceiling.dispose();

@@ -1,5 +1,6 @@
-import { test } from "node:test";
 import { strict as assert } from "node:assert";
+import { test } from "node:test";
+
 import { decodeProbeEvent } from "../docker/probe-events.mjs";
 
 test("probe decoding accepts only tagged RPC notifications", () => {

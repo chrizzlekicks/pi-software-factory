@@ -1,8 +1,9 @@
+import { spawn, execFileSync } from "node:child_process";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { spawn, execFileSync } from "node:child_process";
+
 import { decodeProbeEvent } from "./probe-events.mjs";
 
 if (process.env.PI_SUBAGENT_CHILD === "1") {
@@ -73,10 +74,16 @@ export default function(pi) {
             JSON.stringify({ id: "probe", type: "prompt", message: "/factory-live-probe" }) + "\n",
           );
         }
-        const probe = decodeProbeEvent(event);
-        if (probe || event.type === "response") console.log(JSON.stringify(probe ?? event));
-        if (probe?.probe === "result") result = true;
-        if (probe?.probe === "preflight" && probe.ok === true) loaded = true;
+        const probeEvent = decodeProbeEvent(event);
+        if (probeEvent || event.type === "response") {
+          console.log(JSON.stringify(probeEvent ?? event));
+        }
+        if (probeEvent?.probe === "result") {
+          result = true;
+        }
+        if (probeEvent?.probe === "preflight" && probeEvent.ok === true) {
+          loaded = true;
+        }
       } catch {
         console.error(line);
       }
@@ -104,7 +111,9 @@ export default function(pi) {
       exitCode: code,
     }),
   );
-  if (!factoryLoaded || !loaded || !result || code !== 0) process.exitCode = 1;
+  if (!factoryLoaded || !loaded || !result || code !== 0) {
+    process.exitCode = 1;
+  }
 } finally {
   if (child?.pid) {
     try {

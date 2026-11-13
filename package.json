@@ -5,7 +5,23 @@
   "type": "module",
   "scripts": {
     "test": "node --test test/*.test.ts",
-    "smoke:live": "node docker/live-smoke.mjs"
+    "lint": "oxlint .",
+    "lint:fix": "oxlint . --fix",
+    "fmt": "oxfmt .",
+    "fmt:check": "oxfmt . --check",
+    "typecheck": "tsc --noEmit",
+    "smoke:live": "node docker/live-smoke.mjs",
+    "check": "npm run lint && npm run fmt:check && npm run typecheck"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-agent-core": "^1.5.2",
+    "@earendil-works/pi-ai": "^1.5.2",
+    "@earendil-works/pi-coding-agent": "^1.5.2",
+    "@earendil-works/pi-tui": "^1.5.2",
+    "@types/node": "^24.19.2",
+    "oxfmt": "^0.78.0",
+    "oxlint": "^1.93.0",
+    "typescript": "^7.0.2"
   },
   "engines": {
     "node": ">=24"
@@ -14,9 +30,5 @@
     "extensions": [
       "./src/index.ts"
     ]
-  },
-  "devDependencies": {
-    "oxfmt": "^0.78.0",
-    "oxlint": "^1.93.0"
   }
 }

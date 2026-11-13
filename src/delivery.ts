@@ -1,5 +1,6 @@
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
+
 import { Git, execute } from "./git.ts";
 import type { Run } from "./state.ts";
 
@@ -14,8 +15,9 @@ export class GitHubDelivery {
 
   private async gh(args: string[]) {
     const r = await execute("gh", args, this.git.repo);
-    if (r.code !== 0)
+    if (r.code !== 0) {
       throw new Error(`GitHub CLI failed (${args.slice(0, 2).join(" ")}): ${r.stderr}`);
+    }
     return r.stdout.trim();
   }
 
@@ -23,8 +25,9 @@ export class GitHubDelivery {
     const rules = JSON.parse(
       await this.gh(["api", `repos/${repo}/rules/branches/${encodeURIComponent(branch)}`]),
     );
-    if (!Array.isArray(rules) || rules.length)
+    if (!Array.isArray(rules) || rules.length) {
       throw new Error("Feature branch matches protection rules; refusing to push");
+    }
   }
 
   async preflight(): Promise<NonNullable<Run["target"]>> {
@@ -34,8 +37,10 @@ export class GitHubDelivery {
       /^(?:https:\/\/github\.com\/|git@github\.com:)([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+?)(?:\.git)?$/.exec(
         remote,
       );
-    if (!match) throw new Error("v0.1 requires a github.com origin (HTTPS or git@github.com SSH)");
-    const repo = match[1];
+    const repo = match?.[1];
+    if (!repo) {
+      throw new Error("v0.1 requires a github.com origin (HTTPS or git@github.com SSH)");
+    }
     const info = JSON.parse(
       await this.gh([
         "repo",
@@ -50,29 +55,39 @@ export class GitHubDelivery {
       info.isArchived ||
       !["WRITE", "MAINTAIN", "ADMIN"].includes(info.viewerPermission) ||
       !info.defaultBranchRef?.name
-    )
+    ) {
       throw new Error("Repository is not writable or has no default branch");
+    }
     const base = info.defaultBranchRef.name;
     const remoteHead = JSON.parse(
       await this.gh(["api", `repos/${repo}/branches/${encodeURIComponent(base)}`]),
     ).commit?.sha;
-    if (remoteHead !== this.git.head())
+    if (remoteHead !== this.git.head()) {
       throw new Error("Start at the GitHub default-branch revision; local HEAD differs");
+    }
     await this.rules(repo, "factory/preflight");
     return { repo, base, remote };
   }
 
   async deliver(s: Run, _report: string, boundary: () => void): Promise<NonNullable<Run["pr"]>> {
-    this.git.unchanged(s, s.revision!);
-    if (!/^factory\/[0-9a-f-]{36}$/.test(s.branch) || s.branch === s.target!.base)
+    const revision = s.revision;
+    const target = s.target;
+    const worktree = s.worktree;
+    const plan = s.plans.at(-1);
+    if (!revision || !target || !worktree || !plan) {
+      throw new Error("Missing approved GitHub delivery state");
+    }
+    this.git.unchanged(s, revision);
+    if (!/^factory\/[0-9a-f-]{36}$/.test(s.branch) || s.branch === target.base) {
       throw new Error("Refusing non-factory or protected target branch");
-    await this.rules(s.target!.repo, s.branch);
+    }
+    await this.rules(target.repo, s.branch);
     const existing = JSON.parse(
       await this.gh([
         "pr",
         "list",
         "--repo",
-        s.target!.repo,
+        target.repo,
         "--head",
         s.branch,
         "--state",
@@ -81,16 +96,20 @@ export class GitHubDelivery {
         "url",
       ]),
     );
-    if (!Array.isArray(existing) || existing.length)
+    if (!Array.isArray(existing) || existing.length) {
       throw new Error("PR already exists; reconcile uncertain delivery manually");
+    }
     const remote = await execute(
       "git",
-      ["ls-remote", "--heads", s.target!.remote, `refs/heads/${s.branch}`],
-      s.worktree!,
+      ["ls-remote", "--heads", target.remote, `refs/heads/${s.branch}`],
+      worktree,
     );
-    if (remote.code !== 0) throw new Error("Cannot inspect remote branch");
-    if (remote.stdout.trim())
+    if (remote.code !== 0) {
+      throw new Error("Cannot inspect remote branch");
+    }
+    if (remote.stdout.trim()) {
       throw new Error("Remote factory branch already exists; reconcile rather than overwrite");
+    }
     boundary();
     const push = await execute(
       "git",
@@ -100,13 +119,15 @@ export class GitHubDelivery {
         "push",
         `--force-with-lease=refs/heads/${s.branch}:`,
         "--",
-        s.target!.remote,
-        `${s.revision}:refs/heads/${s.branch}`,
+        target.remote,
+        `${revision}:refs/heads/${s.branch}`,
       ],
-      s.worktree!,
+      worktree,
     );
-    if (push.code !== 0) throw new Error("Push failed or uncertain: " + push.stderr);
-    this.git.unchanged(s, s.revision!);
+    if (push.code !== 0) {
+      throw new Error("Push failed or uncertain: " + push.stderr);
+    }
+    this.git.unchanged(s, revision);
     const body = join(this.artifacts, "pr-body.md");
     // Execution logs can contain credentials; never publish raw agent/command output.
     writeFileSync(
@@ -119,14 +140,14 @@ export class GitHubDelivery {
       "pr",
       "create",
       "--repo",
-      s.target!.repo,
+      target.repo,
       "--base",
-      s.target!.base,
+      target.base,
       "--head",
       s.branch,
       "--draft",
       "--title",
-      s.plans.at(-1)!.summary.slice(0, 200),
+      plan.summary.slice(0, 200),
       "--body-file",
       body,
     ]);
@@ -136,7 +157,7 @@ export class GitHubDelivery {
         "view",
         url,
         "--repo",
-        s.target!.repo,
+        target.repo,
         "--json",
         "url,isDraft,headRefOid,headRefName,baseRefName",
       ]),
@@ -145,10 +166,11 @@ export class GitHubDelivery {
       !pr.isDraft ||
       pr.headRefOid !== s.revision ||
       pr.headRefName !== s.branch ||
-      pr.baseRefName !== s.target!.base ||
-      !pr.url.startsWith(`https://github.com/${s.target!.repo}/pull/`)
-    )
+      pr.baseRefName !== target.base ||
+      !pr.url.startsWith(`https://github.com/${target.repo}/pull/`)
+    ) {
       throw new Error("Draft PR evidence does not match final revision");
+    }
     return { url: pr.url, head: pr.headRefOid, draft: pr.isDraft };
   }
 }

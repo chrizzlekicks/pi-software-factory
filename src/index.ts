@@ -1,26 +1,31 @@
-import * as codingAgent from "@earendil-works/pi-coding-agent";
 import * as agentCore from "@earendil-works/pi-agent-core";
 import * as ai from "@earendil-works/pi-ai";
+import * as codingAgent from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import * as tui from "@earendil-works/pi-tui";
 import * as typebox from "typebox";
 import * as typeboxCompile from "typebox/compile";
 import * as typeboxValue from "typebox/value";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Git } from "./git.ts";
+
+import { loadSubagents, PiAgents } from "./agents.ts";
 import { bergerDisplay } from "./berger.ts";
-import { Store } from "./state.ts";
+import { registerFactoryCommands } from "./commands.ts";
 import { Factory } from "./controller.ts";
 import { GitHubDelivery } from "./delivery.ts";
-import { loadSubagents, PiAgents } from "./agents.ts";
-import { registerFactoryCommands } from "./commands.ts";
+import { Git } from "./git.ts";
+import { Store } from "./state.ts";
 
 export default function factoryExtension(pi: ExtensionAPI) {
   let factory: Factory | undefined;
   let initializing: Promise<Factory> | undefined;
 
   async function get(ctx: ExtensionContext) {
-    if (factory) return factory;
-    if (initializing) return initializing;
+    if (factory) {
+      return factory;
+    }
+    if (initializing) {
+      return initializing;
+    }
     initializing = (async () => {
       const git = new Git(ctx.cwd);
       const store = new Store(git.stateDir());

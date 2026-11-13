@@ -1,9 +1,18 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+
 import type { Factory } from "./controller.ts";
 
-export function registerFactoryCommands(
-  pi: ExtensionAPI,
-  get: (ctx: ExtensionContext) => Promise<Factory>,
+type CommandContext = { ui: Pick<ExtensionContext["ui"], "notify"> };
+
+export function registerFactoryCommands<C extends CommandContext>(
+  pi: {
+    registerCommand(
+      name: string,
+      options: { description: string; handler: (args: string, ctx: C) => Promise<void> },
+    ): void;
+    on(event: "session_shutdown", handler: () => Promise<void>): unknown;
+  },
+  get: (ctx: C) => Promise<Factory>,
   close: () => void,
 ) {
   let pending: Promise<void> | undefined;
@@ -12,13 +21,13 @@ export function registerFactoryCommands(
   const commands = new Set<Promise<void>>();
   let current: Promise<Factory> | undefined;
   const getFactory = () => current;
-  const getCommandFactory = (ctx: ExtensionContext) =>
+  const getCommandFactory = (ctx: C) =>
     (current ??= get(ctx).catch((e) => {
       current = undefined;
       throw e;
     }));
 
-  function start(f: Factory, ctx: ExtensionContext) {
+  function start(f: Factory, ctx: C) {
     pending = f
       .drive()
       .then(() => ctx.ui.notify(f.report(), f.state.phase === "completed" ? "info" : "warning"))
@@ -38,26 +47,36 @@ export function registerFactoryCommands(
       }
       const command = (async () => {
         try {
-          let [action = "status", ...rest] = args.trim().split(/\s+/);
+          const [first = "status", ...rest] = args.trim().split(/\s+/);
+          let action = first;
           if (action === "--delivery") {
             rest.unshift(action);
             action = "request";
           }
-          if (action !== "request" && rest.includes("--delivery"))
+          if (action !== "request" && rest.includes("--delivery")) {
             throw new Error("Place --delivery before the request");
+          }
           const immediate = ["pause", "cancel", "status", "report", "inspect"].includes(action);
-          if (commandBusy && !immediate) throw new Error("Factory command already in progress");
-          if (!immediate) commandBusy = true;
+          if (commandBusy && !immediate) {
+            throw new Error("Factory command already in progress");
+          }
+          if (!immediate) {
+            commandBusy = true;
+          }
           try {
             const f = await getCommandFactory(ctx);
-            if (shuttingDown) throw new Error("Factory is shutting down");
+            if (shuttingDown) {
+              throw new Error("Factory is shutting down");
+            }
             switch (action) {
               case "request": {
                 const mode = rest[0] === "--delivery" ? rest.splice(0, 2)[1] : "local";
-                if (rest.includes("--delivery"))
+                if (rest.includes("--delivery")) {
                   throw new Error("Place --delivery once before the request");
-                if (mode !== "local" && mode !== "github")
+                }
+                if (mode !== "local" && mode !== "github") {
                   throw new Error("Use --delivery local or github");
+                }
                 await f.plan(rest.join(" "), mode);
                 ctx.ui.notify(
                   `Delivery: ${mode}\nPlan awaiting approval:\n${JSON.stringify(f.state.plans.at(-1), null, 2)}`,
@@ -96,10 +115,11 @@ export function registerFactoryCommands(
                 ctx.ui.notify(f.report(), "info");
                 break;
               case "recover":
-                if (rest.join(" ") !== "inspected")
+                if (rest.join(" ") !== "inspected") {
                   throw new Error(
                     "Use /factory recover inspected only after confirming all children stopped and inspecting the checkout",
                   );
+                }
                 await f.replanAfterInterruption();
                 ctx.ui.notify(
                   `Delivery: ${f.state.delivery ?? "github"}\nRecovery plan awaiting approval:\n${JSON.stringify(f.state.plans.at(-1), null, 2)}`,
@@ -114,7 +134,9 @@ export function registerFactoryCommands(
                 );
             }
           } finally {
-            if (!immediate) commandBusy = false;
+            if (!immediate) {
+              commandBusy = false;
+            }
           }
         } catch (e) {
           ctx.ui.notify(String(e), "error");
@@ -132,8 +154,10 @@ export function registerFactoryCommands(
         (await getFactory())?.cancel();
       } catch {}
     }
-    await Promise.allSettled([...commands]);
-    if (pending) await pending;
+    await Promise.allSettled(commands);
+    if (pending) {
+      await pending;
+    }
     close();
   });
 }

@@ -1,26 +1,31 @@
-import { test } from "node:test";
 import { strict as assert } from "node:assert";
+import { test } from "node:test";
+
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+
 import { PiAgents } from "../src/agents.ts";
 
 function fixture() {
-  const handlers = new Map<string, Set<(p: any) => void>>();
+  const handlers = new Map<string, Set<(p: unknown) => void>>();
   const events = {
-    on(name: string, fn: (p: any) => void) {
+    on(name: string, fn: (p: unknown) => void) {
       const set = handlers.get(name) ?? new Set();
       handlers.set(name, set);
       set.add(fn);
       return () => set.delete(fn);
     },
 
-    emit(name: string, p: any) {
-      for (const fn of handlers.get(name) ?? []) fn(p);
+    emit(name: string, p: unknown) {
+      for (const fn of handlers.get(name) ?? []) {
+        fn(p);
+      }
     },
   };
   let disposed = 0,
     valid = true,
     owner = true;
   events.on("subagents:rpc:v1:request", (p) => {
-    if (owner)
+    if (owner && p && typeof p === "object" && "requestId" in p) {
       events.emit(`subagents:rpc:v1:reply:${p.requestId}`, {
         version: 1,
         requestId: p.requestId,
@@ -28,6 +33,7 @@ function fixture() {
         success: true,
         data: { version: 1 },
       });
+    }
   });
   const delegation = {
     SUBAGENT_DELEGATION_REQUEST_EVENT: "request",
@@ -35,7 +41,7 @@ function fixture() {
     SUBAGENT_DELEGATION_UPDATE_EVENT: "update",
     SUBAGENT_DELEGATION_CANCEL_EVENT: "cancel",
   };
-  const api: any = {
+  const api = {
     delegation,
     ceiling: {
       registerSubagentCapabilityCeiling: () => ({
@@ -59,15 +65,31 @@ function fixture() {
           : { ok: false, message: "missing" },
     },
   };
-  const ctx: any = {
-    sessionManager: { getSessionId: () => "session", getSessionFile: () => undefined },
+  const sessionManager = {
+    getSessionId: () => "session",
+    getSessionFile: () => undefined,
+  } satisfies Pick<ExtensionContext["sessionManager"], "getSessionId" | "getSessionFile">;
+  const ctx = {
+    model: undefined,
+    sessionManager,
     isProjectTrusted: () => true,
     modelRegistry: { getAvailable: () => [{ provider: "p", id: "m" }], getAll: () => [] },
     scopedModels: [],
+  } satisfies Pick<ExtensionContext, "model" | "isProjectTrusted" | "scopedModels"> & {
+    sessionManager: Pick<ExtensionContext["sessionManager"], "getSessionId" | "getSessionFile">;
+    modelRegistry: {
+      getAvailable(): Pick<
+        ReturnType<ExtensionContext["modelRegistry"]["getAvailable"]>[number],
+        "provider" | "id"
+      >[];
+      getAll(): Pick<ReturnType<ExtensionContext["modelRegistry"]["getAll"]>[number], "provider">[];
+    };
   };
+  const pi = { events } satisfies Pick<ExtensionAPI, "events">;
   return {
     events,
-    agents: new PiAgents({ events } as any, ctx, api),
+    // The fake host supplies only members exercised by these tests.
+    agents: new PiAgents(pi as unknown as ExtensionAPI, ctx as unknown as ExtensionContext, api),
     disable: () => {
       valid = false;
     },
@@ -80,7 +102,7 @@ function fixture() {
 const id = { requestId: "r", ownerRunId: "o", nodeId: "n" };
 test("delegation correlates all identity fields and accepts structured terminal result", async () => {
   const f = fixture();
-  let request: any;
+  let request: unknown;
   f.events.on("request", (p) => {
     request = p;
     f.events.emit("response", { ...id, nodeId: "other", status: "failed" });
@@ -93,6 +115,7 @@ test("delegation correlates all identity fields and accepts structured terminal 
     );
   });
   assert.deepEqual(await f.agents.run("worker", "work", "/tmp", id), { ok: true });
+  assert.ok(request && typeof request === "object" && "agent" in request);
   assert.equal(request.agent, "worker");
   assert.equal(f.disposed(), 1);
 });
@@ -128,8 +151,10 @@ test("required launch preflight failure prevents delegation", async () => {
 
 test("preflight accepts recognized thinking suffix and passes the delegation schema", async () => {
   const f = fixture();
-  let seen: any;
-  f.agents.api.preflight.resolveSubagentLaunchContract = async (input: any) => {
+  let seen: { outputSchema: unknown } | undefined;
+  f.agents.api.preflight.resolveSubagentLaunchContract = async (input: {
+    outputSchema: unknown;
+  }) => {
     seen = input;
     return {
       ok: true,
@@ -141,6 +166,9 @@ test("preflight accepts recognized thinking suffix and passes the delegation sch
     };
   };
   f.events.on("request", (p) => {
+    assert.ok(seen);
+    assert.ok(p && typeof p === "object" && "result" in p);
+    assert.ok(p.result && typeof p.result === "object" && "schema" in p.result);
     assert.deepEqual(seen.outputSchema, p.result.schema);
     queueMicrotask(() =>
       f.events.emit("response", {
@@ -217,4 +245,13 @@ test("inactive owner fails before dispatch", async () => {
   });
   await assert.rejects(f.agents.run("quality", "review", "/tmp", id), /owner unavailable/);
   assert.equal(called, false);
+});
+
+test("delegation ignores malformed terminal events", async () => {
+  const f = fixture();
+  f.events.on("request", () => {
+    f.events.emit("response", null);
+    f.events.emit("response", { ...id, status: "completed", result: null });
+  });
+  await assert.rejects(f.agents.run("worker", "work", "/tmp", id), /no structured result/);
 });

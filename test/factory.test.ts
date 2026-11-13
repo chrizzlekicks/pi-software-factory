@@ -1,17 +1,29 @@
-import { test } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { execFileSync } from "node:child_process";
+import { test } from "node:test";
+import type { TestContext } from "node:test";
+
 import { Factory } from "../src/controller.ts";
 import { Git } from "../src/git.ts";
 import { Store } from "../src/state.ts";
+import type { Run, Evidence } from "../src/state.ts";
+
+type CommandContext = { ui: { notify(message: string): void } };
+type CommandHandler = (args: string, ctx: CommandContext) => Promise<void>;
+type Command = { description: string; handler: CommandHandler };
+
+function present<T>(value: T | null | undefined): T {
+  assert.ok(value !== null && value !== undefined);
+  return value;
+}
 
 const git = (cwd: string, ...args: string[]) =>
   execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 
-function fixture(t: any, failures = 0) {
+function fixture(t: TestContext, failures = 0) {
   const root = mkdtempSync(join(tmpdir(), "factory-test-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const repo = join(root, "repo");
@@ -39,7 +51,9 @@ function fixture(t: any, failures = 0) {
 
     async run(role: string, task: string, cwd: string) {
       calls.push(role);
-      if (role === "planner") return plan;
+      if (role === "planner") {
+        return plan;
+      }
       if (role === "worker") {
         writeFileSync(join(cwd, "app.txt"), "new");
         return { summary: "Done", scopeChange: "" };
@@ -49,9 +63,10 @@ function fixture(t: any, failures = 0) {
         writeFileSync(join(cwd, "app.txt"), "fixed" + repairs);
         return { summary: "Fixed", scopeChange: "" };
       }
-      if (role === "tester")
+      if (role === "tester") {
         return { passed: ++testRuns > failures, summary: "Tests", commands: plan.verification };
-      if (role === "triage")
+      }
+      if (role === "triage") {
         return {
           findings: [
             {
@@ -63,7 +78,10 @@ function fixture(t: any, failures = 0) {
             },
           ],
         };
-      if (role === "docs") return { summary: "Docs current", changes: false };
+      }
+      if (role === "docs") {
+        return { summary: "Docs current", changes: false };
+      }
       return { summary: "Clean", findings: [] };
     },
   };
@@ -72,13 +90,16 @@ function fixture(t: any, failures = 0) {
       return { repo: "example/repo", base: "main", remote: "https://github.com/example/repo.git" };
     },
 
-    async deliver(s: any) {
+    async deliver(s: Run) {
+      assert.ok(s.revision);
       return { url: "https://github.com/example/repo/pull/1", head: s.revision, draft: true };
     },
   };
   const store = new Store(join(root, "state"));
   t.after(() => {
-    if (existsSync(store.dir)) store.close();
+    if (existsSync(store.dir)) {
+      store.close();
+    }
   });
   const factory = new Factory(store, new Git(repo), agents, delivery);
   return { root, repo, factory, store, calls, plan, repairs: () => repairs };
@@ -93,14 +114,14 @@ test("approval gate, full sequential lifecycle and final revision-bound evidence
   assert.equal(f.store.state?.worktree, undefined);
   await f.factory.approve();
   await f.factory.drive();
-  const s = f.store.state!;
+  const s = present(f.store.state);
   assert.equal(s.phase, "completed");
   assert.equal(s.pr?.draft, true);
   assert.ok(s.evidence.length > 0);
   assert.ok(s.evidence.filter((e) => e.round === s.round).every((e) => e.revision === s.revision));
   assert.equal(git(f.repo, "show", "main:app.txt"), "old");
   assert.equal(s.worktree, f.repo);
-  assert.equal(git(s.worktree!, "status", "--porcelain"), "");
+  assert.equal(git(present(s.worktree), "status", "--porcelain"), "");
   assert.deepEqual(f.calls, [
     "planner",
     "worker",
@@ -123,7 +144,7 @@ test("failures trigger two repairs, then block", async (t) => {
   await f.factory.drive();
   assert.equal(f.repairs(), 2);
   assert.equal(f.store.state?.phase, "blocked");
-  assert.match(f.store.state!.error!, /repair/i);
+  assert.match(present(present(f.store.state).error), /repair/i);
 });
 
 test("one failed test repairs and revalidates", async (t) => {
@@ -143,24 +164,28 @@ test("reject, lock and interrupted execution preserve artifacts", async (t) => {
   await assert.rejects(f.factory.approve(), /plan/i);
   await f.factory.plan("revised", "github");
   await f.factory.approve();
-  f.store.state!.active = { role: "worker", requestId: "uncertain", started: Date.now() };
+  present(f.store.state).active = { role: "worker", requestId: "uncertain", started: Date.now() };
   f.store.save();
   f.store.close();
   const recovered = new Store(f.store.dir);
   t.after(() => {
-    if (existsSync(recovered.dir)) recovered.close();
+    if (existsSync(recovered.dir)) {
+      recovered.close();
+    }
   });
   assert.equal(recovered.state?.phase, "blocked");
   assert.ok(recovered.state?.active);
-  const factory = new Factory(recovered, new Git(f.repo), {} as any, {} as any);
+  const factory = new Factory(recovered, new Git(f.repo), f.factory.agents, f.factory.delivery);
   await assert.rejects(factory.resume(), /uncertain/i);
-  assert.ok(existsSync(recovered.state!.worktree!));
+  assert.ok(existsSync(present(present(recovered.state).worktree)));
 });
 
 test("scope escape blocks delivery and revokes approval", async (t) => {
   const f = fixture(t);
-  (f.factory.agents as any).run = async (role: string, task: string, cwd: string) => {
-    if (role === "planner") return f.plan;
+  f.factory.agents.run = async (role: string, task: string, cwd: string) => {
+    if (role === "planner") {
+      return f.plan;
+    }
     writeFileSync(join(cwd, "unapproved.txt"), "escape");
     return { summary: "done", scopeChange: "" };
   };
@@ -169,7 +194,7 @@ test("scope escape blocks delivery and revokes approval", async (t) => {
   await f.factory.drive();
   assert.equal(f.store.state?.phase, "blocked");
   assert.equal(f.store.state?.approvedRevision, undefined);
-  assert.ok(existsSync(join(f.store.state!.worktree!, "unapproved.txt")));
+  assert.ok(existsSync(join(present(present(f.store.state).worktree), "unapproved.txt")));
 });
 
 test("pause and resume preserve the approval gate", async (t) => {
@@ -181,7 +206,7 @@ test("pause and resume preserve the approval gate", async (t) => {
   await assert.rejects(f.factory.drive(), /runnable/);
   await f.factory.resume();
   await f.factory.drive();
-  assert.equal(f.store.state!.phase, "completed");
+  assert.equal(present(f.store.state).phase, "completed");
 });
 
 test("approved command failure blocks delivery even if tester claims success", async (t) => {
@@ -190,8 +215,8 @@ test("approved command failure blocks delivery even if tester claims success", a
   await f.factory.plan("change", "github");
   await f.factory.approve();
   await f.factory.drive();
-  assert.equal(f.store.state!.phase, "blocked");
-  assert.equal(f.store.state!.pr, undefined);
+  assert.equal(present(f.store.state).phase, "blocked");
+  assert.equal(present(f.store.state).pr, undefined);
   assert.equal(f.repairs(), 2);
 });
 
@@ -214,9 +239,9 @@ test("documentation mutation is reverified at its new revision", async (t) => {
   await f.factory.plan("change", "github");
   await f.factory.approve();
   await f.factory.drive();
-  const s = f.store.state!;
+  const s = present(f.store.state);
   assert.equal(s.phase, "completed");
-  assert.notEqual(s.evidence.find((e) => e.role === "docs")!.revision, s.revision);
+  assert.notEqual(present(s.evidence.find((e) => e.role === "docs")).revision, s.revision);
   assert.ok(s.evidence.some((e) => e.role === "tester" && e.revision === s.revision));
 });
 
@@ -224,7 +249,9 @@ test("worker commit and staged unapproved changes block and preserve artifacts",
   const f = fixture(t);
   const run = f.factory.agents.run.bind(f.factory.agents);
   f.factory.agents.run = async (role, task, cwd, identity, signal) => {
-    if (role !== "worker") return run(role, task, cwd, identity, signal);
+    if (role !== "worker") {
+      return run(role, task, cwd, identity, signal);
+    }
     writeFileSync(join(cwd, "app.txt"), "committed");
     git(cwd, "add", ".");
     git(cwd, "commit", "-m", "unauthorized");
@@ -233,10 +260,10 @@ test("worker commit and staged unapproved changes block and preserve artifacts",
   await f.factory.plan("change", "github");
   await f.factory.approve();
   await f.factory.drive();
-  assert.equal(f.store.state!.phase, "blocked");
-  assert.equal(f.store.state!.approvedRevision, undefined);
-  assert.match(f.store.state!.error!, /HEAD/);
-  assert.equal(f.store.state!.pr, undefined);
+  assert.equal(present(f.store.state).phase, "blocked");
+  assert.equal(present(f.store.state).approvedRevision, undefined);
+  assert.match(present(present(f.store.state).error), /HEAD/);
+  assert.equal(present(f.store.state).pr, undefined);
 });
 
 test("delivery uncertainty is preserved and cannot be resumed", async (t) => {
@@ -247,8 +274,8 @@ test("delivery uncertainty is preserved and cannot be resumed", async (t) => {
   await f.factory.plan("change", "github");
   await f.factory.approve();
   await f.factory.drive();
-  assert.equal(f.store.state!.phase, "blocked");
-  assert.ok(f.store.state!.deliveryIntent);
+  assert.equal(present(f.store.state).phase, "blocked");
+  assert.ok(present(f.store.state).deliveryIntent);
   await assert.rejects(f.factory.resume(), /uncertain/i);
 });
 
@@ -256,15 +283,15 @@ test("recovery requires a new approval", async (t) => {
   const f = fixture(t);
   await f.factory.plan("change", "github");
   await f.factory.approve();
-  f.store.state!.active = { role: "worker", requestId: "stopped", started: Date.now() };
+  present(f.store.state).active = { role: "worker", requestId: "stopped", started: Date.now() };
   f.store.save();
   await f.factory.replanAfterInterruption();
-  assert.equal(f.store.state!.phase, "awaiting_approval");
-  assert.equal(f.store.state!.approvedRevision, undefined);
+  assert.equal(present(f.store.state).phase, "awaiting_approval");
+  assert.equal(present(f.store.state).approvedRevision, undefined);
   await assert.rejects(f.factory.drive(), /approved/);
   await f.factory.approve();
   await f.factory.drive();
-  assert.equal(f.store.state!.phase, "completed");
+  assert.equal(present(f.store.state).phase, "completed");
 });
 
 test("GitHub delivery uses fake gh and a disposable local remote", async (t) => {
@@ -288,8 +315,13 @@ test("GitHub delivery uses fake gh and a disposable local remote", async (t) => 
     TEST_BARE: process.env.TEST_BARE,
   };
   t.after(() => {
-    for (const [k, v] of Object.entries(old))
-      v === undefined ? delete process.env[k] : (process.env[k] = v);
+    for (const [k, v] of Object.entries(old)) {
+      if (v === undefined) {
+        delete process.env[k];
+      } else {
+        process.env[k] = v;
+      }
+    }
   });
   process.env.PATH = bin + ":" + old.PATH;
   process.env.TEST_BASE = git(f.repo, "rev-parse", "HEAD");
@@ -299,10 +331,10 @@ test("GitHub delivery uses fake gh and a disposable local remote", async (t) => 
   git(f.repo, "config", `url.${bare}.insteadOf`, "https://github.com/example/repo.git");
   await f.factory.approve();
   await f.factory.drive();
-  assert.equal(f.store.state!.phase, "completed", f.store.state!.error);
+  assert.equal(present(f.store.state).phase, "completed", present(f.store.state).error);
   assert.equal(
-    git(f.root, "--git-dir", bare, "rev-parse", `refs/heads/${f.store.state!.branch}`),
-    f.store.state!.revision,
+    git(f.root, "--git-dir", bare, "rev-parse", `refs/heads/${present(f.store.state).branch}`),
+    present(f.store.state).revision,
   );
 });
 
@@ -310,7 +342,7 @@ test("uncertain and cancelled runs cannot be replaced or recovered", async (t) =
   const f = fixture(t);
   await f.factory.plan("change", "github");
   await f.factory.approve();
-  const s = f.store.state!;
+  const s = present(f.store.state);
   s.active = { role: "worker", requestId: "uncertain", started: Date.now() };
   s.cancelled = true;
   s.phase = "blocked";
@@ -324,7 +356,7 @@ test("recovery preserves repair count and rejects quality blocks", async (t) => 
   const f = fixture(t);
   await f.factory.plan("change", "github");
   await f.factory.approve();
-  const s = f.store.state!;
+  const s = present(f.store.state);
   s.phase = "blocked";
   s.repairs = 2;
   f.store.save();
@@ -355,14 +387,16 @@ test("pause after tester prevents approved commands and reviewers", async (t) =>
   const run = f.factory.agents.run.bind(f.factory.agents);
   f.factory.agents.run = async (...args) => {
     const result = await run(...args);
-    if (args[0] === "tester") f.factory.pause();
+    if (args[0] === "tester") {
+      f.factory.pause();
+    }
     return result;
   };
   await f.factory.drive();
-  assert.equal(f.store.state!.paused, true);
+  assert.equal(present(f.store.state).paused, true);
   assert.equal(f.calls.includes("quality"), false);
   assert.equal(
-    f.store.state!.evidence.some((e) => e.role === "command"),
+    present(f.store.state).evidence.some((e) => e.role === "command"),
     false,
   );
 });
@@ -374,8 +408,8 @@ test("approval interruption during preflight prevents worktree creation", async 
     f.factory.cancel();
   };
   await assert.rejects(f.factory.approve(), /stop/i);
-  assert.equal(f.store.state!.cancelled, true);
-  assert.equal(f.store.state!.worktree, undefined);
+  assert.equal(present(f.store.state).cancelled, true);
+  assert.equal(present(f.store.state).worktree, undefined);
 });
 
 test("invalid persisted evidence is rejected without rewriting the state", async (t) => {
@@ -386,7 +420,7 @@ test("invalid persisted evidence is rejected without rewriting the state", async
   f.store.close();
   const path = join(f.store.dir, "state.json");
   const s = JSON.parse(readFileSync(path, "utf8"));
-  s.evidence.find((e: any) => e.role === "tester").result = { passed: true };
+  s.evidence.find((e: Evidence) => e.role === "tester").result = { passed: true };
   const invalid = JSON.stringify(s);
   writeFileSync(path, invalid);
   assert.throws(() => new Store(f.store.dir), /invalid/i);
@@ -400,8 +434,8 @@ test("restart blocks a nonterminal boundary even without an active child", async
   f.store.close();
   const reopened = new Store(f.store.dir);
   try {
-    assert.equal(reopened.state!.phase, "blocked");
-    assert.match(reopened.state!.error!, /Interrupted/);
+    assert.equal(present(reopened.state).phase, "blocked");
+    assert.match(present(present(reopened.state).error), /Interrupted/);
   } finally {
     reopened.close();
   }
@@ -412,11 +446,15 @@ test("persisted delivery evidence must match approved commands", async (t) => {
   await f.factory.plan("change", "github");
   await f.factory.approve();
   await f.factory.drive();
-  const state = f.store.state!;
+  const state = present(f.store.state);
   assert.equal(state.phase, "completed");
-  const command = state.evidence.find((e) => e.role === "command" && e.round === state.round)!;
-  (command.result as any).command = {
-    ...(command.result as any).command,
+  const command = present(
+    state.evidence.find((e) => e.role === "command" && e.round === state.round),
+  );
+  assert.ok(command.result && typeof command.result === "object" && "command" in command.result);
+  assert.ok(command.result.command && typeof command.result.command === "object");
+  command.result.command = {
+    ...command.result.command,
     args: ["-e", "process.exit(1)"],
   };
   f.store.save();
@@ -427,14 +465,14 @@ test("persisted delivery evidence must match approved commands", async (t) => {
 test("command dispatch gates planning, concurrent approval and shutdown", async (t) => {
   const { registerFactoryCommands } = await import("../src/commands.ts");
   const f = fixture(t);
-  let handler: any, shutdown: any;
+  let handler!: CommandHandler, shutdown!: () => Promise<void>;
   const notices: string[] = [];
   const pi = {
-    registerCommand(_name: string, command: any) {
+    registerCommand(_name: string, command: Command) {
       handler = command.handler;
     },
 
-    on(_event: string, cb: any) {
+    on(_event: string, cb: () => Promise<void>) {
       shutdown = cb;
     },
   };
@@ -446,13 +484,13 @@ test("command dispatch gates planning, concurrent approval and shutdown", async 
     },
   };
   registerFactoryCommands(
-    pi as any,
+    pi,
     async () => f.factory,
     () => f.store.close(),
   );
   await handler("request change app", ctx);
   assert.deepEqual(f.calls, ["planner"]);
-  assert.equal(f.store.state!.phase, "awaiting_approval");
+  assert.equal(present(f.store.state).phase, "awaiting_approval");
   let release!: () => void;
   const waiting = new Promise<void>((r) => {
     release = r;
@@ -473,9 +511,10 @@ test("command dispatch gates planning, concurrent approval and shutdown", async 
 
 test("command pause and cancel interrupt planning without approval", async (t) => {
   const { registerFactoryCommands } = await import("../src/commands.ts");
+  // oxlint-disable no-await-in-loop -- Pause and cancel each exercise a complete command lifecycle; serialize fixture cleanup.
   for (const action of ["pause", "cancel"]) {
     const f = fixture(t);
-    let handler: any;
+    let handler!: CommandHandler;
     let release!: () => void;
     const started = new Promise<void>((resolve) => {
       f.factory.agents.run = async () => {
@@ -487,7 +526,7 @@ test("command pause and cancel interrupt planning without approval", async (t) =
       };
     });
     const pi = {
-      registerCommand(_name: string, command: any) {
+      registerCommand(_name: string, command: Command) {
         handler = command.handler;
       },
 
@@ -495,7 +534,7 @@ test("command pause and cancel interrupt planning without approval", async (t) =
     };
     const ctx = { ui: { notify() {} } };
     registerFactoryCommands(
-      pi as any,
+      pi,
       async () => f.factory,
       () => f.store.close(),
     );
@@ -504,17 +543,18 @@ test("command pause and cancel interrupt planning without approval", async (t) =
     await handler(action, ctx);
     release();
     await request;
-    assert.equal(f.store.state!.approvedRevision, undefined);
-    assert.equal(f.store.state!.phase, "failed");
-    assert.equal(f.store.state!.paused, true);
-    assert.equal(f.store.state!.cancelled, action === "cancel");
+    assert.equal(present(f.store.state).approvedRevision, undefined);
+    assert.equal(present(f.store.state).phase, "failed");
+    assert.equal(present(f.store.state).paused, true);
+    assert.equal(present(f.store.state).cancelled, action === "cancel");
   }
+  // oxlint-enable no-await-in-loop
 });
 
 test("concurrent commands share initialization and deny a duplicate request", async (t) => {
   const { registerFactoryCommands } = await import("../src/commands.ts");
   const f = fixture(t);
-  let handler: any,
+  let handler!: CommandHandler,
     release!: () => void,
     calls = 0;
   const notices: string[] = [];
@@ -522,7 +562,7 @@ test("concurrent commands share initialization and deny a duplicate request", as
     release = r;
   });
   const pi = {
-    registerCommand(_name: string, command: any) {
+    registerCommand(_name: string, command: Command) {
       handler = command.handler;
     },
 
@@ -536,7 +576,7 @@ test("concurrent commands share initialization and deny a duplicate request", as
     },
   };
   registerFactoryCommands(
-    pi as any,
+    pi,
     async () => {
       calls++;
       await gate;
@@ -551,18 +591,19 @@ test("concurrent commands share initialization and deny a duplicate request", as
   await Promise.all([first, status]);
   assert.equal(calls, 1);
   assert.ok(notices.some((n) => /already in progress/.test(n)));
-  assert.equal(f.store.state!.request, "first");
+  assert.equal(present(f.store.state).request, "first");
 });
 
 test("persisted delivery state rejects inconsistent task or documentation", async (t) => {
+  // oxlint-disable no-await-in-loop -- Complete each plan, execution, and reload before corrupting the next isolated store.
   for (const corrupt of [
-    (s: any) => {
+    (s: Run) => {
       s.task = 0;
     },
-    (s: any) => {
+    (s: Run) => {
       s.documented = false;
     },
-    (s: any) => {
+    (s: Run) => {
       s.approvedRevision = undefined;
     },
   ]) {
@@ -570,14 +611,17 @@ test("persisted delivery state rejects inconsistent task or documentation", asyn
     await f.factory.plan("change", "github");
     await f.factory.approve();
     await f.factory.drive();
+    assert.ok(f.store.state);
     corrupt(f.store.state);
     f.store.save();
     f.store.close();
     assert.throws(() => new Store(f.store.dir), /Invalid factory state/);
   }
+  // oxlint-enable no-await-in-loop
 });
 
 test("pause or cancellation during recovery preflight stops recovery", async (t) => {
+  // oxlint-disable no-await-in-loop -- Each preflight-stop race needs ordered setup, release, and cleanup.
   for (const action of ["pause", "cancel"] as const) {
     const f = fixture(t);
     await f.factory.plan("change", "local");
@@ -610,13 +654,14 @@ test("pause or cancellation during recovery preflight stops recovery", async (t)
     assert.equal(f.factory.state.cancelled, action === "cancel");
     assert.equal(f.factory.state.phase, "blocked");
   }
+  // oxlint-enable no-await-in-loop
 });
 
 test("cancellation during recovery planning persists across restart", async (t) => {
   const f = fixture(t);
   await f.factory.plan("change", "github");
   await f.factory.approve();
-  f.store.state!.active = { role: "worker", requestId: "stopped", started: Date.now() };
+  present(f.store.state).active = { role: "worker", requestId: "stopped", started: Date.now() };
   f.store.save();
   let started!: () => void, release!: () => void;
   const waiting = new Promise<void>((r) => {
@@ -638,8 +683,8 @@ test("cancellation during recovery planning persists across restart", async (t) 
   f.store.close();
   const reopened = new Store(f.store.dir);
   try {
-    assert.equal(reopened.state!.cancelled, true);
-    assert.equal(reopened.state!.phase, "blocked");
+    assert.equal(present(reopened.state).cancelled, true);
+    assert.equal(present(reopened.state).phase, "blocked");
     await assert.rejects(
       new Factory(reopened, new Git(f.repo), f.factory.agents, f.factory.delivery).approve(),
       /plan/i,
@@ -653,12 +698,13 @@ test("final review findings require exact triage and persisted findings", async 
   const f = fixture(t);
   const run = f.factory.agents.run.bind(f.factory.agents);
   f.factory.agents.run = async (...args) => {
-    if (args[0] === "quality")
+    if (args[0] === "quality") {
       return {
         summary: "Review",
         findings: [{ id: "suspect", blocking: true, evidence: "Suspected defect" }],
       };
-    if (args[0] === "triage")
+    }
+    if (args[0] === "triage") {
       return {
         findings: [
           {
@@ -669,33 +715,39 @@ test("final review findings require exact triage and persisted findings", async 
           },
         ],
       };
+    }
     return run(...args);
   };
   await f.factory.plan("change", "github");
   await f.factory.approve();
   await f.factory.drive();
-  assert.equal(f.store.state!.phase, "completed", f.store.state!.error);
+  assert.equal(present(f.store.state).phase, "completed", present(f.store.state).error);
   f.store.close();
   const path = join(f.store.dir, "state.json");
   const valid = JSON.parse(readFileSync(path, "utf8"));
   const reopened = new Store(f.store.dir);
   reopened.close();
   for (const corrupt of [
-    (s: any) => {
+    (s: Run) => {
       s.findings = [];
     },
-    (s: any) => {
-      s.evidence.find(
-        (e: any) => e.round === s.round && e.role === "triage",
-      ).result.findings[0].confirmed = true;
+    (s: Run) => {
+      const triage = s.evidence.find((e) => e.round === s.round && e.role === "triage");
+      assert.ok(triage?.result && typeof triage.result === "object" && "findings" in triage.result);
+      assert.ok(Array.isArray(triage.result.findings));
+      const finding: unknown = triage.result.findings[0];
+      assert.ok(finding && typeof finding === "object" && "confirmed" in finding);
+      finding.confirmed = true;
     },
-    (s: any) => {
-      s.evidence.find((e: any) => e.round === s.round && e.role === "triage").result.findings = [
-        {},
-      ];
+    (s: Run) => {
+      const triage = s.evidence.find((e) => e.round === s.round && e.role === "triage");
+      assert.ok(triage?.result && typeof triage.result === "object" && "findings" in triage.result);
+      triage.result.findings = [{}];
     },
-    (s: any) => {
-      s.evidence = s.evidence.filter((e: any) => !(e.round === s.round && e.role === "triage"));
+    (s: Run) => {
+      s.evidence = s.evidence.filter(
+        (e: Evidence) => !(e.round === s.round && e.role === "triage"),
+      );
       s.findings = [];
     },
   ]) {
@@ -717,11 +769,17 @@ test("final gate rejects current review blockers absent from findings", async (t
   const run = f.factory.agents.run.bind(f.factory.agents);
   f.factory.agents.run = async (...args) => {
     const result = await run(...args);
-    if (args[0] === "ponytail" && f.store.state!.documented) {
-      const quality = f.store.state!.evidence.find(
-        (e) => e.role === "quality" && e.round === f.store.state!.round,
-      )!;
-      (quality.result as any).findings.push({
+    if (args[0] === "ponytail" && present(f.store.state).documented) {
+      const quality = present(
+        present(f.store.state).evidence.find(
+          (e) => e.role === "quality" && e.round === present(f.store.state).round,
+        ),
+      );
+      assert.ok(
+        quality.result && typeof quality.result === "object" && "findings" in quality.result,
+      );
+      assert.ok(Array.isArray(quality.result.findings));
+      quality.result.findings.push({
         id: "hidden",
         blocking: true,
         evidence: "Hidden blocker",
@@ -730,8 +788,8 @@ test("final gate rejects current review blockers absent from findings", async (t
     return result;
   };
   await f.factory.drive();
-  assert.equal(f.store.state!.phase, "blocked");
-  assert.equal(f.store.state!.pr, undefined);
+  assert.equal(present(f.store.state).phase, "blocked");
+  assert.equal(present(f.store.state).pr, undefined);
 });
 
 test("local delivery persists selection and completes without GitHub or pre-approval mutations", async (t) => {
@@ -743,9 +801,9 @@ test("local delivery persists selection and completes without GitHub or pre-appr
     throw new Error("GitHub delivery must not run");
   };
   await f.factory.plan("change app", "local");
-  assert.equal(f.store.state!.delivery, "local");
-  assert.equal(f.store.state!.target, undefined);
-  assert.equal(f.store.state!.worktree, undefined);
+  assert.equal(present(f.store.state).delivery, "local");
+  assert.equal(present(f.store.state).target, undefined);
+  assert.equal(present(f.store.state).worktree, undefined);
   assert.deepEqual(f.calls, ["planner"]);
   f.store.close();
   const reopened = new Store(f.store.dir);
@@ -763,7 +821,7 @@ test("local delivery persists selection and completes without GitHub or pre-appr
       branch: s.branch,
       worktree: s.worktree,
     });
-    assert.equal(git(s.worktree!, "rev-parse", "HEAD"), s.revision);
+    assert.equal(git(present(s.worktree), "rev-parse", "HEAD"), s.revision);
     assert.match(factory.report(), /no push or PR/);
   } finally {
     reopened.close();
@@ -779,17 +837,19 @@ test("local persisted receipt fails closed when altered but permits later edits"
   const original = readFileSync(path, "utf8");
   f.store.close();
   for (const mutate of [
-    (s: any) => {
+    (s: Run) => {
       s.step = "implement";
       s.evidence = [];
     },
-    (s: any) => {
+    (s: Run) => {
       delete s.localReceipt;
     },
-    (s: any) => {
+    (s: Run) => {
+      assert.ok(s.localReceipt);
       s.localReceipt.revision = "forged";
     },
-    (s: any) => {
+    (s: Run) => {
+      assert.ok(s.revision);
       s.pr = { url: "https://example.invalid", head: s.revision, draft: true };
     },
   ]) {
@@ -801,7 +861,7 @@ test("local persisted receipt fails closed when altered but permits later edits"
     assert.equal(readFileSync(path, "utf8"), corrupted);
   }
   writeFileSync(path, original);
-  writeFileSync(join(f.store.state!.worktree!, "app.txt"), "dirty");
+  writeFileSync(join(present(present(f.store.state).worktree), "app.txt"), "dirty");
   const reopened = new Store(f.store.dir);
   try {
     const factory = new Factory(reopened, new Git(f.repo), f.factory.agents, f.factory.delivery);
@@ -853,6 +913,7 @@ test("default delivery completes locally without GitHub preflight or delivery", 
 
 test("command request forms default to local and accept explicit GitHub", async (t) => {
   const { registerFactoryCommands } = await import("../src/commands.ts");
+  // oxlint-disable no-await-in-loop -- Keep independent Git-backed command fixtures serial for deterministic cleanup.
   for (const [input, mode] of [
     ["Build app", "local"],
     ["request Build app", "local"],
@@ -860,16 +921,16 @@ test("command request forms default to local and accept explicit GitHub", async 
     ["request --delivery github Build app", "github"],
   ]) {
     const f = fixture(t);
-    let handler: any;
+    let handler!: CommandHandler;
     const notices: string[] = [];
     registerFactoryCommands(
       {
-        registerCommand(_name: string, command: any) {
+        registerCommand(_name: string, command: Command) {
           handler = command.handler;
         },
 
         on() {},
-      } as any,
+      },
       async () => f.factory,
       () => {},
     );
@@ -884,6 +945,7 @@ test("command request forms default to local and accept explicit GitHub", async 
     assert.equal(f.factory.state.delivery, mode);
     assert.ok(notices.some((notice) => notice.includes(`Delivery: ${mode}`)));
   }
+  // oxlint-enable no-await-in-loop
 });
 
 test("local final test failure exhausts two repairs without delivery", async (t) => {
@@ -892,17 +954,17 @@ test("local final test failure exhausts two repairs without delivery", async (t)
   await f.factory.approve();
   await f.factory.drive();
   assert.equal(f.repairs(), 2);
-  assert.equal(f.store.state!.phase, "blocked");
-  assert.equal(f.store.state!.localReceipt, undefined);
+  assert.equal(present(f.store.state).phase, "blocked");
+  assert.equal(present(f.store.state).localReceipt, undefined);
 });
 
 test("request delivery selector preserves request words and rejects missing mode or request", async (t) => {
   const { registerFactoryCommands } = await import("../src/commands.ts");
   const f = fixture(t);
-  let handler: any;
+  let handler!: CommandHandler;
   const notices: string[] = [];
   const pi = {
-    registerCommand(_name: string, command: any) {
+    registerCommand(_name: string, command: Command) {
       handler = command.handler;
     },
 
@@ -916,7 +978,7 @@ test("request delivery selector preserves request words and rejects missing mode
     },
   };
   registerFactoryCommands(
-    pi as any,
+    pi,
     async () => f.factory,
     () => {},
   );
@@ -924,6 +986,7 @@ test("request delivery selector preserves request words and rejects missing mode
   assert.equal(f.store.state, undefined);
   await handler("request --delivery local", ctx);
   assert.equal(f.store.state, undefined);
+  // oxlint-disable no-await-in-loop -- Check each invalid form leaves the shared handler state-free before the next.
   for (const input of [
     "--delivery",
     "--delivery local",
@@ -935,9 +998,10 @@ test("request delivery selector preserves request words and rejects missing mode
     await handler(input, ctx);
     assert.equal(f.store.state, undefined, input);
   }
+  // oxlint-enable no-await-in-loop
   await handler("--delivery local keep --option value", ctx);
-  assert.equal(f.store.state!.request, "keep --option value");
-  assert.equal(f.store.state!.delivery, "local");
+  assert.equal(present(f.store.state).request, "keep --option value");
+  assert.equal(present(f.store.state).delivery, "local");
   assert.ok(notices.some((n) => /Delivery: local/.test(n)));
 });
 
@@ -945,23 +1009,25 @@ test("local confirmed review blocker exhausts repairs", async (t) => {
   const f = fixture(t);
   const run = f.factory.agents.run.bind(f.factory.agents);
   f.factory.agents.run = async (role, task, cwd, identity, signal) => {
-    if (role === "quality")
+    if (role === "quality") {
       return {
         summary: "Defect",
         findings: [{ id: "defect", blocking: true, evidence: "app.txt" }],
       };
-    if (role === "triage")
+    }
+    if (role === "triage") {
       return {
         findings: [{ id: "quality:defect", blocking: true, confirmed: true, evidence: "app.txt" }],
       };
+    }
     return run(role, task, cwd, identity, signal);
   };
   await f.factory.plan("change", "local");
   await f.factory.approve();
   await f.factory.drive();
   assert.equal(f.repairs(), 2);
-  assert.equal(f.store.state!.phase, "blocked");
-  assert.equal(f.store.state!.localReceipt, undefined);
+  assert.equal(present(f.store.state).phase, "blocked");
+  assert.equal(present(f.store.state).localReceipt, undefined);
 });
 
 test("local dirty review worktree cannot complete", async (t) => {
@@ -969,14 +1035,16 @@ test("local dirty review worktree cannot complete", async (t) => {
   const run = f.factory.agents.run.bind(f.factory.agents);
   f.factory.agents.run = async (role, task, cwd, identity, signal) => {
     const result = await run(role, task, cwd, identity, signal);
-    if (role === "quality") writeFileSync(join(cwd, "app.txt"), "dirty");
+    if (role === "quality") {
+      writeFileSync(join(cwd, "app.txt"), "dirty");
+    }
     return result;
   };
   await f.factory.plan("change", "local");
   await f.factory.approve();
   await f.factory.drive();
-  assert.equal(f.store.state!.phase, "blocked");
-  assert.equal(f.store.state!.localReceipt, undefined);
+  assert.equal(present(f.store.state).phase, "blocked");
+  assert.equal(present(f.store.state).localReceipt, undefined);
 });
 
 test("legacy GitHub state without mode remains valid", async (t) => {
@@ -989,19 +1057,20 @@ test("legacy GitHub state without mode remains valid", async (t) => {
   writeFileSync(path, JSON.stringify(s));
   const reopened = new Store(f.store.dir);
   try {
-    assert.equal(reopened.state!.delivery, undefined);
-    assert.ok(reopened.state!.target);
+    assert.equal(present(reopened.state).delivery, undefined);
+    assert.ok(present(reopened.state).target);
   } finally {
     reopened.close();
   }
 });
 
 test("approved delivery mode cannot be switched in memory or on restart", async (t) => {
+  // oxlint-disable no-await-in-loop -- Each mode-switch scenario mutates and reloads its own Git-backed run.
   for (const mode of ["local", "github"] as const) {
     const f = fixture(t);
     await f.factory.plan("change", mode);
     await f.factory.approve();
-    const s = f.store.state!;
+    const s = present(f.store.state);
     assert.equal(s.approvedDelivery, mode);
     const target = {
       repo: "example/repo",
@@ -1019,6 +1088,7 @@ test("approved delivery mode cannot be switched in memory or on restart", async 
     assert.throws(() => new Store(f.store.dir), /invalid/i);
     assert.equal(readFileSync(path, "utf8"), corrupted);
   }
+  // oxlint-enable no-await-in-loop
 });
 
 test("approved legacy GitHub state without either mode remains runnable", async (t) => {
@@ -1160,12 +1230,15 @@ test("inspected paused edits require renewed approval and fresh verification", a
 });
 
 test("approval branch creation interruption remains loadable and uncertain before and after switch", async (t) => {
+  // oxlint-disable no-await-in-loop -- Reconcile each interrupted branch-create repository before starting the next.
   for (const after of [false, true]) {
     const f = fixture(t);
     await f.factory.plan("change", "local");
     const create = f.factory.git.create.bind(f.factory.git);
     f.factory.git.create = (s) => {
-      if (after) create(s);
+      if (after) {
+        create(s);
+      }
       throw new Error("interrupted");
     };
     await assert.rejects(f.factory.approve(), /interrupted/);
@@ -1173,23 +1246,25 @@ test("approval branch creation interruption remains loadable and uncertain befor
     f.store.close();
     const reopened = new Store(f.store.dir);
     try {
-      assert.equal(reopened.state!.phase, "blocked");
-      assert.equal(reopened.state!.active?.role, "branch-create");
+      assert.equal(present(reopened.state).phase, "blocked");
+      assert.equal(present(reopened.state).active?.role, "branch-create");
       await assert.rejects(
         new Factory(reopened, new Git(f.repo), f.factory.agents, f.factory.delivery).resume(),
         /uncertain/i,
       );
       assert.equal(
         git(f.repo, "branch", "--show-current"),
-        after ? reopened.state!.branch : "main",
+        after ? present(reopened.state).branch : "main",
       );
     } finally {
       reopened.close();
     }
   }
+  // oxlint-enable no-await-in-loop
 });
 
 test("recovery checkpoint failures before and after commit retain durable intent and files", async (t) => {
+  // oxlint-disable no-await-in-loop -- Reconcile each interrupted checkpoint's Git and store state before the next case.
   for (const after of [false, true]) {
     const f = fixture(t);
     await f.factory.plan("change", "local");
@@ -1199,19 +1274,24 @@ test("recovery checkpoint failures before and after commit retain durable intent
     await f.factory.replanAfterInterruption();
     const checkpoint = f.factory.git.checkpoint.bind(f.factory.git);
     f.factory.git.checkpoint = (s, p) => {
-      if (after) checkpoint(s, p);
-      else git(f.repo, "add", "app.txt");
+      if (after) {
+        checkpoint(s, p);
+      } else {
+        git(f.repo, "add", "app.txt");
+      }
       throw new Error("commit interrupted");
     };
     await assert.rejects(f.factory.approve(), /interrupted/);
     f.store.close();
     const reopened = new Store(f.store.dir);
     try {
-      assert.equal(reopened.state!.active?.role, "checkpoint");
-      assert.equal(reopened.state!.phase, "blocked");
+      assert.equal(present(reopened.state).active?.role, "checkpoint");
+      assert.equal(present(reopened.state).phase, "blocked");
       assert.equal(readFileSync(join(f.repo, "app.txt"), "utf8"), "inspected");
-      assert.equal(git(f.repo, "branch", "--show-current"), reopened.state!.branch);
-      if (!after) assert.equal(git(f.repo, "diff", "--cached", "--name-only"), "app.txt");
+      assert.equal(git(f.repo, "branch", "--show-current"), present(reopened.state).branch);
+      if (!after) {
+        assert.equal(git(f.repo, "diff", "--cached", "--name-only"), "app.txt");
+      }
       await assert.rejects(
         new Factory(reopened, new Git(f.repo), f.factory.agents, f.factory.delivery).resume(),
         /uncertain/i,
@@ -1220,6 +1300,7 @@ test("recovery checkpoint failures before and after commit retain durable intent
       reopened.close();
     }
   }
+  // oxlint-enable no-await-in-loop
 });
 
 test("paused ignored configuration and dependencies are bound to resume and recovery approval", async (t) => {
@@ -1267,12 +1348,15 @@ test("pause snapshot is captured after worker generated ignored files settle", a
 });
 
 test("delivery pause recovery persists loadable replanning states and requires fresh approval", async (t) => {
+  // oxlint-disable no-await-in-loop -- Each outcome walks a full durable run/restart path; serialize Git and store recovery.
   for (const outcome of ["throw", "cancel", "success"] as const) {
     const f = fixture(t);
     await f.factory.plan("change", "local");
     await f.factory.approve();
     f.factory.changed = (s) => {
-      if (s.step === "deliver" && !s.paused) f.factory.pause();
+      if (s.step === "deliver" && !s.paused) {
+        f.factory.pause();
+      }
     };
     await f.factory.drive();
     const s = f.factory.state;
@@ -1288,22 +1372,31 @@ test("delivery pause recovery persists loadable replanning states and requires f
     };
     const snapshots: string[] = [];
     f.factory.changed = (state) => {
-      if (state.phase === "planning")
+      if (state.phase === "planning") {
         snapshots.push(readFileSync(join(f.store.dir, "state.json"), "utf8"));
+      }
     };
     const run = f.factory.agents.run.bind(f.factory.agents);
     f.factory.agents.run = async (...args) => {
-      if (args[0] !== "planner") return run(...args);
-      if (outcome === "throw") throw new Error("planner failed");
-      if (outcome === "cancel") f.factory.cancel();
+      if (args[0] !== "planner") {
+        return run(...args);
+      }
+      if (outcome === "throw") {
+        throw new Error("planner failed");
+      }
+      if (outcome === "cancel") {
+        f.factory.cancel();
+      }
       return f.plan;
     };
-    if (outcome === "success") await f.factory.replanAfterInterruption();
-    else
+    if (outcome === "success") {
+      await f.factory.replanAfterInterruption();
+    } else {
       await assert.rejects(
         f.factory.replanAfterInterruption(),
         outcome === "throw" ? /planner failed/ : /stop/i,
       );
+    }
     assert.ok(snapshots.length >= 2);
     for (const [i, snapshot] of snapshots.entries()) {
       const dir = join(f.root, `snapshot-${i}`);
@@ -1312,14 +1405,14 @@ test("delivery pause recovery persists loadable replanning states and requires f
       writeFileSync(join(dir, "state.json"), snapshot);
       const reopened = new Store(dir);
       try {
-        assert.equal(reopened.state!.phase, "blocked");
-        assert.equal(reopened.state!.step, "implement");
-        assert.equal(reopened.state!.approvedRevision, undefined);
-        assert.equal(reopened.state!.approvedDelivery, undefined);
-        assert.equal(reopened.state!.branch, previous.branch);
-        assert.equal(reopened.state!.revision, previous.revision);
-        assert.equal(reopened.state!.repairs, previous.repairs);
-        assert.equal(reopened.state!.evidence.length, previous.evidence);
+        assert.equal(present(reopened.state).phase, "blocked");
+        assert.equal(present(reopened.state).step, "implement");
+        assert.equal(present(reopened.state).approvedRevision, undefined);
+        assert.equal(present(reopened.state).approvedDelivery, undefined);
+        assert.equal(present(reopened.state).branch, previous.branch);
+        assert.equal(present(reopened.state).revision, previous.revision);
+        assert.equal(present(reopened.state).repairs, previous.repairs);
+        assert.equal(present(reopened.state).evidence.length, previous.evidence);
       } finally {
         reopened.close();
       }
@@ -1349,5 +1442,20 @@ test("delivery pause recovery persists loadable replanning states and requires f
     } finally {
       reopened.close();
     }
+  }
+  // oxlint-enable no-await-in-loop
+});
+
+test("persisted optional object fields reject non-objects without rewriting state", async (t) => {
+  const f = fixture(t);
+  await f.factory.plan("change", "github");
+  f.store.close();
+  const path = join(f.store.dir, "state.json");
+  const valid = JSON.parse(readFileSync(path, "utf8"));
+  for (const key of ["active", "pr", "localReceipt"]) {
+    const invalid = JSON.stringify({ ...valid, [key]: false });
+    writeFileSync(path, invalid);
+    assert.throws(() => new Store(f.store.dir), /invalid/i);
+    assert.equal(readFileSync(path, "utf8"), invalid);
   }
 });

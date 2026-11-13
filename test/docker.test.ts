@@ -1,11 +1,13 @@
-import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { test } from "node:test";
 
 const entry = resolve("docker/entrypoint.sh");
-const cleanEnv = { PATH: process.env.PATH!, HOME: "/nonexistent" };
+const path = process.env.PATH;
+assert.ok(path, "PATH is required to launch shell utilities");
+const cleanEnv = { PATH: path, HOME: "/nonexistent" };
 const run = (args: string[], env = {}) =>
   spawnSync("sh", [entry, ...args], { env: { ...cleanEnv, ...env }, encoding: "utf8" });
 
