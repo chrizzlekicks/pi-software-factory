@@ -3,6 +3,10 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "scripts": {
+    "test": "node --test test/*.test.ts",
+    "smoke:live": "node docker/live-smoke.mjs"
+  },
   "engines": {
     "node": ">=24"
   },
@@ -11,8 +15,8 @@
       "./src/index.ts"
     ]
   },
-  "scripts": {
-    "test": "node --test test/*.test.ts",
-    "smoke:live": "node docker/live-smoke.mjs"
+  "devDependencies": {
+    "oxfmt": "^0.78.0",
+    "oxlint": "^1.93.0"
   }
 }
