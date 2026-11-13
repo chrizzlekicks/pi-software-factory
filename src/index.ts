@@ -21,17 +21,44 @@ export default function factoryExtension(pi: ExtensionAPI) {
     if (factory) return factory;
     if (initializing) return initializing;
     initializing = (async () => {
-    const git = new Git(ctx.cwd);
-    const store = new Store(git.stateDir());
-    const hostModules = { '@earendil-works/pi-coding-agent': codingAgent, '@earendil-works/pi-agent-core': agentCore, '@earendil-works/pi-ai': ai, '@earendil-works/pi-tui': tui, typebox, 'typebox/compile': typeboxCompile, 'typebox/value': typeboxValue };
-    let adapter: Promise<PiAgents> | undefined;
-    const getAdapter = () => adapter ??= loadSubagents(hostModules).then(api => new PiAgents(pi, ctx, api)).catch(e => { adapter = undefined; throw e; });
-    const agents = { preflight: async (cwd: string) => (await getAdapter()).preflight(cwd), run: async (...args: Parameters<PiAgents['run']>) => (await getAdapter()).run(...args) };
-    const display = bergerDisplay();
-    factory = new Factory(store, git, agents, new GitHubDelivery(git, store.dir), s => { pi.events.emit('pi-factory:phase', { runId: s.id, phase: s.phase }); display(s); });
-    return factory;
+      const git = new Git(ctx.cwd);
+      const store = new Store(git.stateDir());
+      const hostModules = {
+        '@earendil-works/pi-coding-agent': codingAgent,
+        '@earendil-works/pi-agent-core': agentCore,
+        '@earendil-works/pi-ai': ai,
+        '@earendil-works/pi-tui': tui,
+        typebox,
+        'typebox/compile': typeboxCompile,
+        'typebox/value': typeboxValue,
+      };
+      let adapter: Promise<PiAgents> | undefined;
+      const getAdapter = () =>
+        (adapter ??= loadSubagents(hostModules)
+          .then((api) => new PiAgents(pi, ctx, api))
+          .catch((e) => {
+            adapter = undefined;
+            throw e;
+          }));
+      const agents = {
+        preflight: async (cwd: string) => (await getAdapter()).preflight(cwd),
+        run: async (...args: Parameters<PiAgents['run']>) => (await getAdapter()).run(...args),
+      };
+      const display = bergerDisplay();
+      factory = new Factory(store, git, agents, new GitHubDelivery(git, store.dir), (s) => {
+        pi.events.emit('pi-factory:phase', { runId: s.id, phase: s.phase });
+        display(s);
+      });
+      return factory;
     })();
-    try { return await initializing; } finally { initializing = undefined; }
+    try {
+      return await initializing;
+    } finally {
+      initializing = undefined;
+    }
   }
-  registerFactoryCommands(pi, get, () => { factory?.store.close(); factory = undefined; });
+  registerFactoryCommands(pi, get, () => {
+    factory?.store.close();
+    factory = undefined;
+  });
 }
