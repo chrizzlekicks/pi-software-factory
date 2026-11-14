@@ -30,7 +30,7 @@ export const roles: Record<
   { agent: string; readOnly: boolean; schema: unknown; skill?: string }
 > = {
   planner: {
-    agent: "scout",
+    agent: "architect",
     readOnly: true,
     schema: object({
       summary: text,

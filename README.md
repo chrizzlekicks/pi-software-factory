@@ -5,7 +5,7 @@ Pi Software Factory is a Pi extension for an approval-gated, sequential implemen
 ## Prerequisites
 
 - Node.js 24 or newer and Git with author and committer identity configured.
-- A compatible Pi coding agent and separately installed and loaded pi-subagents extension, with configured and authenticated models. The `scout`, `worker`, `test-runner`, `reviewer`, and `docs-auditor` agents and `ponytail-review` skill must be available.
+- A compatible Pi coding agent and separately installed and loaded pi-subagents extension, with configured and authenticated models. The `architect`, `worker`, `test-runner`, `reviewer`, and `docs-auditor` agents and `ponytail-review` skill must be available.
 - A clean Git checkout with an existing HEAD. GitHub delivery additionally requires authenticated GitHub CLI (`gh`), a supported github.com origin, a checkout at the GitHub default-branch revision, and repository write access. Local delivery needs no origin, GitHub CLI, or GitHub authentication; model authentication is still required.
 
 See [compatibility](COMPATIBILITY.md) for tested versions and integration limits. Set `PI_FACTORY_SUBAGENTS_PATH` to the installed pi-subagents package directory if package resolution cannot find it.

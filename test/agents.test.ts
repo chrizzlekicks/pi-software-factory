@@ -3,7 +3,12 @@ import { test } from "node:test";
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-import { PiAgents } from "../src/agents.ts";
+import { PiAgents, roles } from "../src/agents.ts";
+
+test("planner uses the architect with read-only capabilities", () => {
+  assert.equal(roles.planner?.agent, "architect");
+  assert.equal(roles.planner?.readOnly, true);
+});
 
 function fixture() {
   const handlers = new Map<string, Set<(p: unknown) => void>>();
