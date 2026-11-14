@@ -1,16 +1,44 @@
 import { strict as assert } from "node:assert";
+import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Value } from "typebox/value";
 
-import { PiAgents, roles } from "../src/agents.ts";
+import { loadSubagents, PiAgents, roles } from "../src/agents.ts";
+import { validatePlan } from "../src/git.ts";
 
-test("planner uses the architect with read-only capabilities", () => {
+test("planner uses the trusted architect", () => {
   assert.equal(roles.planner?.agent, "architect");
-  assert.equal(roles.planner?.readOnly, true);
+  assert.equal(roles.planner?.readOnly, false);
 });
 
-function fixture() {
+test("planner schema rejects empty required plan lists before factory validation", () => {
+  const plan = {
+    summary: "Change app",
+    tasks: ["Change app"],
+    files: ["app.txt"],
+    risks: [],
+    dependencies: [],
+    verification: [{ command: "npm", args: ["test"], purpose: "Test" }],
+  };
+  const schema = roles.planner?.schema as Parameters<typeof Value.Check>[0];
+  assert.equal(Value.Check(schema, plan), true);
+  assert.deepEqual(validatePlan(plan), plan);
+  for (const field of ["tasks", "files", "verification"] as const) {
+    const invalid = { ...plan, [field]: [] };
+    assert.equal(Value.Check(schema, invalid), false, field);
+    assert.throws(() => validatePlan(invalid), /Invalid plan/);
+  }
+});
+
+function fixture(plannerTools?: {
+  effectiveAllowlist: string[];
+  fanoutAuthorized: boolean;
+  configuredExtensions: string[];
+}) {
   const handlers = new Map<string, Set<(p: unknown) => void>>();
   const events = {
     on(name: string, fn: (p: unknown) => void) {
@@ -26,6 +54,7 @@ function fixture() {
       }
     },
   };
+  const ceilings: unknown[] = [];
   let disposed = 0,
     valid = true,
     owner = true;
@@ -49,11 +78,14 @@ function fixture() {
   const api = {
     delegation,
     ceiling: {
-      registerSubagentCapabilityCeiling: () => ({
-        dispose() {
-          disposed++;
-        },
-      }),
+      registerSubagentCapabilityCeiling: (input: unknown) => {
+        ceilings.push(input);
+        return {
+          dispose() {
+            disposed++;
+          },
+        };
+      },
       resolveCurrentSubagentCapabilityCeiling: () => ({}),
     },
     preflight: {
@@ -64,7 +96,7 @@ function fixture() {
               contract: {
                 model: "p/m",
                 skills: { resolved: [] },
-                tools: { effectiveAllowlist: ["read"] },
+                tools: plannerTools ?? { effectiveAllowlist: ["read"] },
               },
             }
           : { ok: false, message: "missing" },
@@ -93,6 +125,7 @@ function fixture() {
   const pi = { events } satisfies Pick<ExtensionAPI, "events">;
   return {
     events,
+    ceilings,
     // The fake host supplies only members exercised by these tests.
     agents: new PiAgents(pi as unknown as ExtensionAPI, ctx as unknown as ExtensionContext, api),
     disable: () => {
@@ -259,4 +292,152 @@ test("delegation ignores malformed terminal events", async () => {
     f.events.emit("response", { ...id, status: "completed", result: null });
   });
   await assert.rejects(f.agents.run("worker", "work", "/tmp", id), /no structured result/);
+});
+
+test("planner preflight accepts an unverified extension without proving web activation", async () => {
+  const f = fixture({
+    effectiveAllowlist: ["subagent", "web_enable"],
+    fanoutAuthorized: true,
+    configuredExtensions: ["/trusted/web.js"],
+  });
+  await assert.rejects(
+    f.agents.run("planner", "plan", "/tmp", id, AbortSignal.abort()),
+    /cancelled/i,
+  );
+});
+
+test("planner ceiling grants scout, researcher and web without changing reviewer policy", async () => {
+  const f = fixture();
+  await assert.rejects(f.agents.run("planner", "plan", "/tmp", id), /Architect requires/);
+  await assert.rejects(
+    f.agents.run("quality", "review", "/tmp", id, AbortSignal.abort()),
+    /cancelled/i,
+  );
+  const [planner, reviewer] = f.ceilings as {
+    ceiling: { allowedAgents: string[]; allowedTools: string[]; denyExtensions: boolean };
+  }[];
+  assert.deepEqual(planner?.ceiling.allowedAgents, ["architect", "scout", "researcher"]);
+  for (const tool of [
+    "subagent",
+    "web_enable",
+    "web_search",
+    "fetch_content",
+    "get_search_content",
+    "bash",
+    "write",
+  ]) {
+    assert.ok(planner?.ceiling.allowedTools.includes(tool), tool);
+  }
+  assert.equal(planner?.ceiling.denyExtensions, false);
+  assert.deepEqual(reviewer?.ceiling.allowedTools, ["read", "grep", "find", "ls"]);
+  assert.equal(reviewer?.ceiling.denyExtensions, true);
+});
+
+test("installed pi-subagents resolves architect, scout and researcher contracts under planner ceiling", async (t) => {
+  const root =
+    process.env.PI_FACTORY_SUBAGENTS_PATH ??
+    join(homedir(), ".pi/agent/npm/node_modules/pi-subagents");
+  const web = join(homedir(), ".pi/agent/npm/node_modules/pi-web-access/dist/index.js");
+  if (!existsSync(join(root, "package.json")) || !existsSync(web)) {
+    return t.skip("installed integration packages unavailable");
+  }
+  const cwd = mkdtempSync(join(tmpdir(), "factory-contract-"));
+  try {
+    mkdirSync(join(cwd, ".pi/agents"), { recursive: true });
+    writeFileSync(
+      join(cwd, ".pi/agents/architect.md"),
+      `---\nname: architect\ndescription: contract test\ntools: subagent, web_enable, web_search, source_check, fetch_content, get_search_content\nsubagentOnlyExtensions: ${web}\n---\nPlan.\n`,
+    );
+    writeFileSync(
+      join(cwd, ".pi/settings.json"),
+      JSON.stringify({
+        subagents: {
+          agentOverrides: {
+            researcher: {
+              tools: [
+                "read",
+                "write",
+                "web_enable",
+                "web_search",
+                "source_check",
+                "fetch_content",
+                "get_search_content",
+              ],
+              subagentOnlyExtensions: [web],
+            },
+          },
+        },
+      }),
+    );
+    const api = await loadSubagents({});
+    const ceiling = {
+      allowedAgents: ["architect", "scout", "researcher"],
+      allowedTools: [
+        "read",
+        "grep",
+        "find",
+        "ls",
+        "bash",
+        "write",
+        "subagent",
+        "web_enable",
+        "web_search",
+        "source_check",
+        "fetch_content",
+        "get_search_content",
+      ],
+      denyExtensions: false,
+    };
+    const input = {
+      cwd,
+      context: "fresh",
+      projectTrusted: true,
+      parentModel: { provider: "test", id: "test" },
+      intercomBridge: { mode: "off" },
+      capabilityCeiling: ceiling,
+    };
+    const architect = await api.preflight.resolveSubagentLaunchContract({
+      ...input,
+      agent: "architect",
+      outputSchema: roles.planner?.schema,
+    });
+    assert.equal(architect.ok, true, architect.message);
+    assert.equal(architect.contract.tools.fanoutAuthorized, true);
+    assert.ok(architect.contract.tools.configuredExtensions.includes(web));
+    for (const name of [
+      "subagent",
+      "web_enable",
+      "web_search",
+      "fetch_content",
+      "get_search_content",
+    ]) {
+      assert.ok(architect.contract.tools.effectiveAllowlist.includes(name), name);
+    }
+    const scout = await api.preflight.resolveSubagentLaunchContract({ ...input, agent: "scout" });
+    assert.equal(scout.ok, true, scout.message);
+    assert.ok(scout.contract.tools.effectiveAllowlist.includes("bash"));
+    assert.ok(scout.contract.tools.effectiveAllowlist.includes("write"));
+    const researcher = await api.preflight.resolveSubagentLaunchContract({
+      ...input,
+      agent: "researcher",
+    });
+    assert.equal(researcher.ok, true, researcher.message);
+    assert.equal(researcher.contract.agent.source, "builtin");
+    assert.equal(researcher.contract.agent.filePath, join(root, "agents/researcher.md"));
+    assert.ok(researcher.contract.tools.configuredExtensions.includes(web));
+    for (const name of [
+      "web_enable",
+      "web_search",
+      "source_check",
+      "fetch_content",
+      "get_search_content",
+    ]) {
+      assert.ok(researcher.contract.tools.effectiveAllowlist.includes(name), name);
+    }
+    const worker = await api.preflight.resolveSubagentLaunchContract({ ...input, agent: "worker" });
+    assert.equal(worker.ok, false);
+    assert.equal(worker.code, "restricted_agent");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
 });

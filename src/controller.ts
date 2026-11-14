@@ -137,7 +137,7 @@ export class Factory {
       const plan = validatePlan(
         await this.agent(
           "planner",
-          `Inspect repository READ ONLY. Plan this request: ${request}\nReturn dependencies, risks, exact allowed file paths (directory prefixes end in /), ordered tasks and concrete build/test/black-box verification commands as executable + argv. Include documentation paths. No implementation. Commands and files will require human approval.`,
+          `Delegate repository inspection to scout and, when useful, web research to researcher, instructing it to call web_enable first. Do not implement changes. Plan this request: ${request}\nReturn dependencies, risks, exact allowed file paths (directory prefixes end in /), ordered tasks and concrete build/test/black-box verification commands as executable + argv. Include documentation paths. Propose at least one task, file path and verification command; these are proposals for human approval, not already-approved scope. No implementation.`,
         ),
       );
       this.boundary();
@@ -321,7 +321,7 @@ export class Factory {
       const plan = validatePlan(
         await this.agent(
           "planner",
-          `Recovery: human has inspected the stopped execution and confirmed no child is still running. Existing work must be preserved; do NOT assume interrupted tasks completed. Inspect current checkout and plan remaining work for request ${s.request}. Include ALL changed paths since ${s.baseRevision} in allowed files and approved verification commands.`,
+          `Recovery: human has inspected the stopped execution and confirmed no child is still running. Existing work must be preserved; do NOT assume interrupted tasks completed. Delegate current checkout inspection to scout and, when useful, web research to researcher, instructing it to call web_enable first. Plan remaining work for request ${s.request}. Propose at least one task, file path and verification command for human approval. Include ALL changed paths since ${s.baseRevision} in the proposed allowed files.`,
         ),
       );
       this.boundary();

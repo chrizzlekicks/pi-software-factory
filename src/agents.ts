@@ -31,14 +31,14 @@ export const roles: Record<
 > = {
   planner: {
     agent: "architect",
-    readOnly: true,
+    readOnly: false,
     schema: object({
       summary: text,
-      tasks: texts,
-      files: texts,
+      tasks: { ...texts, minItems: 1 },
+      files: { ...texts, minItems: 1 },
       risks: texts,
       dependencies: texts,
-      verification: { type: "array", items: command, maxItems: 16 },
+      verification: { type: "array", items: command, minItems: 1, maxItems: 16 },
     }),
   },
   worker: {
@@ -125,13 +125,29 @@ export class PiAgents implements Agents {
       sessionId: this.ctx.sessionManager.getSessionId(),
       source: "pi-factory:" + role,
       ceiling: {
-        allowedAgents: [r.agent],
-        allowedTools: r.readOnly
-          ? ["read", "grep", "find", "ls"]
-          : role === "tester"
-            ? ["read", "bash"]
-            : ["read", "grep", "find", "ls", "bash", "edit", "write"],
-        denyExtensions: true,
+        allowedAgents: role === "planner" ? ["architect", "scout", "researcher"] : [r.agent],
+        allowedTools:
+          role === "planner"
+            ? [
+                "read",
+                "grep",
+                "find",
+                "ls",
+                "bash",
+                "write",
+                "subagent",
+                "web_enable",
+                "web_search",
+                "source_check",
+                "fetch_content",
+                "get_search_content",
+              ]
+            : r.readOnly
+              ? ["read", "grep", "find", "ls"]
+              : role === "tester"
+                ? ["read", "bash"]
+                : ["read", "grep", "find", "ls", "bash", "edit", "write"],
+        denyExtensions: role !== "planner",
       },
     });
   }
@@ -183,6 +199,16 @@ export class PiAgents implements Agents {
       !result.contract.skills.resolved.some((s: { name: string }) => s.name === r.skill)
     ) {
       throw new Error("Required skill unavailable: " + r.skill);
+    }
+    if (role === "planner") {
+      const tools = result.contract.tools;
+      const required = ["subagent", "web_enable"];
+      const missing = required.filter((name) => !tools.effectiveAllowlist.includes(name));
+      if (missing.length || !tools.fanoutAuthorized || !tools.configuredExtensions.length) {
+        throw new Error(
+          `Architect requires nested delegation and a configured web provider; missing tools: ${missing.join(", ") || "none"}`,
+        );
+      }
     }
     if (r.readOnly) {
       const unexpected = result.contract.tools.effectiveAllowlist.filter(
