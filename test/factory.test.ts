@@ -211,7 +211,7 @@ test("pause and resume preserve the approval gate", async (t) => {
 
 test("approved command failure blocks delivery even if tester claims success", async (t) => {
   const f = fixture(t);
-  f.plan.verification[0].args = ["-e", "process.exit(1)"];
+  present(f.plan.verification[0]).args = ["-e", "process.exit(1)"];
   await f.factory.plan("change", "github");
   await f.factory.approve();
   await f.factory.drive();
@@ -919,7 +919,7 @@ test("command request forms default to local and accept explicit GitHub", async 
     ["request Build app", "local"],
     ["--delivery github Build app", "github"],
     ["request --delivery github Build app", "github"],
-  ]) {
+  ] as const) {
     const f = fixture(t);
     let handler!: CommandHandler;
     const notices: string[] = [];
@@ -1000,8 +1000,9 @@ test("request delivery selector preserves request words and rejects missing mode
   }
   // oxlint-enable no-await-in-loop
   await handler("--delivery local keep --option value", ctx);
-  assert.equal(present(f.store.state).request, "keep --option value");
-  assert.equal(present(f.store.state).delivery, "local");
+  const state = f.factory.state;
+  assert.equal(state.request, "keep --option value");
+  assert.equal(state.delivery, "local");
   assert.ok(notices.some((n) => /Delivery: local/.test(n)));
 });
 
