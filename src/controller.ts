@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { writeFileSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { Git, execute, validatePlan } from "./git.ts";
@@ -294,23 +294,55 @@ export class Factory {
   async replanAfterInterruption() {
     this.idle();
     const s = this.state;
-    if (!s.worktree || (!s.active && !s.paused) || s.cancelled || s.deliveryIntent) {
+    const initialPlanner =
+      !s.worktree &&
+      s.location === "checkout" &&
+      (s.active?.role === "planner" ||
+        (!s.active && (s.phase === "failed" || s.phase === "blocked"))) &&
+      s.plans.length === 0 &&
+      !s.approvedRevision &&
+      !s.deliveryIntent;
+    if (
+      !initialPlanner &&
+      (!s.worktree || (!s.active && !s.paused) || s.cancelled || s.deliveryIntent)
+    ) {
       throw new Error(
         "Uncertain Git/delivery operation needs manual reconciliation; artifacts preserved",
       );
     }
-    this.git.assertOwned(s);
+    if (initialPlanner) {
+      if (s.repo !== this.git.repo || !this.git.clean() || this.git.head() !== s.baseRevision) {
+        throw new Error("Repository changed since planning; inspect and reconcile manually");
+      }
+    } else {
+      this.git.assertOwned(s);
+    }
     if (s.paused) {
       this.pauseWanted = false;
     }
+    if (initialPlanner) {
+      this.cancelWanted = false;
+    }
     this.running = true;
     try {
-      await this.agents.preflight(s.worktree);
+      await this.agents.preflight(s.worktree ?? s.repo);
       this.boundary();
-      const snapshot = this.git.snapshot(s);
+      const snapshot = initialPlanner ? undefined : this.git.snapshot(s);
+      if (initialPlanner) {
+        if (!this.git.clean() || this.git.head() !== s.baseRevision) {
+          throw new Error("Repository changed since planning; inspect and reconcile manually");
+        }
+        if (!existsSync(join(this.store.dir, s.id + ".json"))) {
+          this.store.archive();
+        }
+        s.cancelled = false;
+        this.cancelWanted = false;
+      }
       s.approvedRevision = undefined;
       s.approvedDelivery = undefined;
-      s.active = undefined;
+      if (!initialPlanner) {
+        s.active = undefined;
+      }
       s.paused = false;
       s.pauseSnapshot = undefined;
       s.error = undefined;
@@ -325,12 +357,18 @@ export class Factory {
         ),
       );
       this.boundary();
-      if (this.git.snapshot(s) !== snapshot) {
+      if (
+        initialPlanner
+          ? !this.git.clean() || this.git.head() !== s.baseRevision
+          : this.git.snapshot(s) !== snapshot
+      ) {
         throw new Error("Checkout changed during recovery planning");
       }
       s.recoverySnapshot = snapshot;
       s.plans.push(plan);
-      s.planRevision++;
+      if (!initialPlanner) {
+        s.planRevision++;
+      }
       s.round++;
       this.save("awaiting_approval");
     } catch (e) {

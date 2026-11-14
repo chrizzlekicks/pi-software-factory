@@ -1460,3 +1460,76 @@ test("persisted optional object fields reject non-objects without rewriting stat
     assert.equal(readFileSync(path, "utf8"), invalid);
   }
 });
+
+test("inspected initial planner interruption replans without replacing artifacts", async (t) => {
+  const f = fixture(t);
+  const run = f.factory.agents.run;
+  f.factory.agents.run = async () => {
+    throw new Error("planner interrupted");
+  };
+  await assert.rejects(f.factory.plan("change", "local"), /interrupted/);
+  f.factory.cancel();
+  f.factory.agents.run = run;
+  const s = f.factory.state;
+  await assert.rejects(f.factory.plan("another"), /uncertain/);
+  writeFileSync(join(f.repo, "app.txt"), "preserve");
+  await assert.rejects(f.factory.replanAfterInterruption(), /changed since planning/);
+  assert.equal(s.active?.role, "planner");
+  assert.equal(readFileSync(join(f.repo, "app.txt"), "utf8"), "preserve");
+  writeFileSync(join(f.repo, "app.txt"), "old");
+  await f.factory.replanAfterInterruption();
+  assert.equal(s.phase, "awaiting_approval");
+  assert.equal(s.planRevision, 1);
+  assert.equal(s.cancelled, false);
+  assert.equal(
+    JSON.parse(readFileSync(join(f.store.dir, s.id + ".json"), "utf8")).active.role,
+    "planner",
+  );
+  f.store.close();
+  const reopened = new Store(f.store.dir);
+  try {
+    assert.equal(reopened.state?.phase, "awaiting_approval");
+  } finally {
+    reopened.close();
+  }
+});
+
+test("initial planner validation and checkout failures remain recoverable on retry", async (t) => {
+  // oxlint-disable no-await-in-loop -- Each case verifies sequential durable recovery attempts.
+  for (const failure of ["invalid plan", "changed checkout"] as const) {
+    const f = fixture(t);
+    const run = f.factory.agents.run;
+    f.factory.agents.run = async () => {
+      if (failure === "invalid plan") {
+        return { ...f.plan, tasks: [] };
+      }
+      writeFileSync(join(f.repo, "app.txt"), "planner change");
+      return f.plan;
+    };
+    await assert.rejects(f.factory.plan("change", "local"));
+    assert.equal(f.factory.state.active, undefined);
+    if (failure === "changed checkout") {
+      await assert.rejects(f.factory.replanAfterInterruption(), /changed since planning/);
+      writeFileSync(join(f.repo, "app.txt"), "old");
+    }
+    await assert.rejects(f.factory.replanAfterInterruption());
+    assert.equal(f.factory.state.phase, "blocked");
+    assert.equal(f.factory.state.active, undefined);
+    if (failure === "changed checkout") {
+      writeFileSync(join(f.repo, "app.txt"), "old");
+    }
+    f.store.close();
+    const reopened = new Store(f.store.dir);
+    try {
+      f.factory.agents.run = run;
+      const factory = new Factory(reopened, new Git(f.repo), f.factory.agents, f.factory.delivery);
+      await factory.replanAfterInterruption();
+      assert.equal(factory.state.phase, "awaiting_approval");
+      assert.equal(factory.state.planRevision, 1);
+      assert.equal(factory.state.plans.length, 1);
+    } finally {
+      reopened.close();
+    }
+  }
+  // oxlint-enable no-await-in-loop
+});
