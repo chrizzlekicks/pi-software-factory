@@ -302,9 +302,18 @@ export class Factory {
       s.plans.length === 0 &&
       !s.approvedRevision &&
       !s.deliveryIntent;
+    const exhaustedQualityGate =
+      s.phase === "blocked" &&
+      s.step === "verify" &&
+      s.repairs >= 2 &&
+      s.error === "Error: Two repair cycles exhausted; human intervention required" &&
+      s.findings.some((f) => f.blocking && f.confirmed);
     if (
       !initialPlanner &&
-      (!s.worktree || (!s.active && !s.paused) || s.cancelled || s.deliveryIntent)
+      (!s.worktree ||
+        (!s.active && !s.paused && !exhaustedQualityGate) ||
+        s.cancelled ||
+        s.deliveryIntent)
     ) {
       throw new Error(
         "Uncertain Git/delivery operation needs manual reconciliation; artifacts preserved",

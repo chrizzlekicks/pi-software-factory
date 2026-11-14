@@ -26,7 +26,7 @@ After approval, the factory creates and switches to a new `factory/...` branch i
 
 - `/factory status`, `/factory inspect`, and `/factory report` show progress, persisted state, and evidence.
 - `/factory pause` requests a stop at the next safe boundary; `/factory resume` continues a paused approved run. `/factory cancel` requests cancellation and preserves artifacts.
-- For an interrupted agent or paused checkout with no delivery intent, first confirm all child processes have stopped and inspect the checkout and artifacts, then use `/factory recover inspected` to create a new plan requiring approval. An interrupted initial planner can also be recovered after cancellation, provided the checkout is clean and still at the original revision; otherwise reconcile manually without discarding changes.
+- For an interrupted agent, paused checkout, or quality gate blocked after exhausting repair cycles, with no delivery intent, first confirm all child processes have stopped and inspect the checkout, findings and artifacts, then use `/factory recover inspected` to create a new plan requiring approval. The repair count and prior evidence are retained; verification and review still apply. An interrupted initial planner can also be recovered after cancellation, provided the checkout is clean and still at the original revision; otherwise reconcile manually without discarding changes.
 
 Interrupted operations and uncertain delivery block automatic replay. Inspect the checkout, local and GitHub branches, and PR before acting. Remove a stale `writer.lock` only after confirming no writer or child remains. Uncertain branch creation or delivery requires manual reconciliation; do not delete artifacts or blindly retry. There is no automated delivery reconciliation.
 

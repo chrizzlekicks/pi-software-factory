@@ -352,7 +352,7 @@ test("uncertain and cancelled runs cannot be replaced or recovered", async (t) =
   assert.equal(s.active.requestId, "uncertain");
 });
 
-test("recovery preserves repair count and rejects quality blocks", async (t) => {
+test("recovery preserves repair count and rejects unrelated blocks", async (t) => {
   const f = fixture(t);
   await f.factory.plan("change", "github");
   await f.factory.approve();
@@ -365,6 +365,41 @@ test("recovery preserves repair count and rejects quality blocks", async (t) => 
   f.store.save();
   await f.factory.replanAfterInterruption();
   assert.equal(s.repairs, 2);
+});
+
+test("inspected recovery replans an exhausted quality gate without bypassing approval or verification", async (t) => {
+  const f = fixture(t, 99);
+  await f.factory.plan("change", "github");
+  await f.factory.approve();
+  await f.factory.drive();
+  const s = present(f.store.state);
+  assert.equal(s.phase, "blocked");
+  assert.equal(s.step, "verify");
+  assert.equal(s.paused, false);
+  assert.equal(s.active, undefined);
+  const evidence = structuredClone(s.evidence);
+  const findings = structuredClone(s.findings);
+  const base = s.baseRevision;
+  const revision = s.revision;
+  const contents = readFileSync(join(f.repo, "app.txt"), "utf8");
+  await assert.rejects(f.factory.resume(), /quality gate/i);
+  await f.factory.replanAfterInterruption();
+  assert.equal(s.phase, "awaiting_approval");
+  assert.equal(s.approvedRevision, undefined);
+  assert.equal(s.planRevision, 2);
+  assert.equal(s.repairs, 2);
+  assert.deepEqual(s.evidence, evidence);
+  assert.deepEqual(s.findings, findings);
+  assert.equal(s.baseRevision, base);
+  assert.equal(s.revision, revision);
+  assert.equal(readFileSync(join(f.repo, "app.txt"), "utf8"), contents);
+  await assert.rejects(f.factory.resume(), /approval/i);
+  await assert.rejects(f.factory.drive(), /approved/i);
+  await f.factory.approve();
+  await f.factory.drive();
+  assert.equal(s.phase, "blocked");
+  assert.equal(s.pr, undefined);
+  assert.ok(s.evidence.length > evidence.length);
 });
 
 test("invalid persisted gate fields fail closed without modifying the file", async (t) => {
