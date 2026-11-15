@@ -1,5 +1,6 @@
+import { isUtf8 } from "node:buffer";
 import { execFileSync, spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   realpathSync,
   lstatSync,
@@ -8,10 +9,26 @@ import {
   readSync,
   closeSync,
   constants,
+  mkdirSync,
+  existsSync,
+  readFileSync,
+  unlinkSync,
 } from "node:fs";
 import { join, resolve, relative, isAbsolute } from "node:path";
 
 import type { Command, Plan, Run } from "./state.ts";
+
+export function validCommitSubject(subject: unknown): subject is string {
+  return (
+    typeof subject === "string" &&
+    subject.length <= 72 &&
+    // oxlint-disable-next-line no-control-regex -- Commit subjects must not contain terminal controls.
+    !/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/.test(subject) &&
+    /^(docs|fix|feat|refactor|test|chore|build|ci|perf|revert|style)(\([a-zA-Z0-9._/-]+\))?!?: [^\s\r\n](?:[^\r\n]*[^\s\r\n])?$/.test(
+      subject,
+    )
+  );
+}
 
 export function execute(
   command: string,
@@ -103,26 +120,41 @@ export class Git {
   }
 
   create(s: Run) {
-    if (!this.clean() || this.head() !== s.baseRevision) {
-      throw new Error("Repository changed since planning");
+    if (
+      s.location !== "worktree" ||
+      s.repo !== this.repo ||
+      !/^[0-9a-f-]{36}$/.test(s.id) ||
+      s.branch !== `factory/${s.id}` ||
+      this.head() !== s.baseRevision
+    ) {
+      throw new Error("Invalid factory worktree base");
     }
-    this.git(["switch", "-c", s.branch, s.baseRevision]);
-    return this.repo;
+    const parent = join(this.stateDir(), "worktrees");
+    const worktree = join(parent, s.id);
+    if (existsSync(worktree) || this.git(["branch", "--list", s.branch])) {
+      throw new Error("Factory worktree or branch already exists");
+    }
+    mkdirSync(parent, { recursive: true, mode: 0o700 });
+    this.git(["worktree", "add", "-b", s.branch, worktree, s.baseRevision]);
+    return realpathSync(worktree);
   }
 
   assertOwned(s: Run): asserts s is Run & { worktree: string } {
-    if (s.location !== "checkout") {
+    if (s.location !== "worktree") {
       throw new Error(
         "Legacy execution location: inspect the original worktree and recover manually; automatic continuation is unsupported",
       );
     }
     if (
       !s.worktree ||
-      s.worktree !== s.repo ||
+      !/^[0-9a-f-]{36}$/.test(s.id) ||
+      realpathSync(s.worktree) !== join(realpathSync(join(this.stateDir(), "worktrees")), s.id) ||
       s.repo !== this.repo ||
-      !s.branch.startsWith("factory/")
+      s.branch !== "factory/" + s.id ||
+      realpathSync(resolve(s.worktree, this.git(["rev-parse", "--git-common-dir"], s.worktree))) !==
+        realpathSync(resolve(this.repo, this.git(["rev-parse", "--git-common-dir"])))
     ) {
-      throw new Error("Invalid factory checkout location");
+      throw new Error("Invalid factory worktree location");
     }
     if (this.git(["symbolic-ref", "--short", "HEAD"], s.worktree) !== s.branch) {
       throw new Error("Checkout branch changed; inspect before continuing");
@@ -132,6 +164,23 @@ export class Git {
   snapshot(s: Run) {
     this.assertOwned(s);
     const hash = createHash("sha256");
+    for (const args of [
+      ["diff", "--raw", "-z", "--no-renames", "--ignore-submodules=none", s.baseRevision],
+      [
+        "diff",
+        "--cached",
+        "--raw",
+        "-z",
+        "--no-renames",
+        "--ignore-submodules=none",
+        s.baseRevision,
+      ],
+    ]) {
+      const raw = this.git(args, s.worktree);
+      if (/(?:^|\0):(?:160000 [0-7]{6}|[0-7]{6} 160000) /.test(raw)) {
+        throw new Error("Changed submodules cannot be reviewed safely");
+      }
+    }
     hash.update(this.head(s.worktree));
     for (const args of [
       ["diff", "--binary", "HEAD"],
@@ -141,7 +190,9 @@ export class Git {
         execFileSync("git", args, { cwd: s.worktree, maxBuffer: 8_000_000, timeout: 30_000 }),
       );
     }
-    const paths = this.git(["ls-files", "--others", "-z"], s.worktree).split("\0").filter(Boolean);
+    const paths = this.git(["ls-files", "--others", "--exclude-standard", "-z"], s.worktree)
+      .split("\0")
+      .filter(Boolean);
     paths.sort();
     if (paths.length > 200_000) {
       throw new Error("Snapshot file limit exceeded; inspected recovery required");
@@ -196,38 +247,133 @@ export class Git {
     ];
   }
 
+  reviewText(s: Run) {
+    this.assertOwned(s);
+    for (const args of [
+      ["diff", "--no-ext-diff", "--numstat", "-z", s.baseRevision],
+      ["diff", "--cached", "--no-ext-diff", "--numstat", "-z", s.baseRevision],
+    ]) {
+      if (/(?:^|\0)-\t-\t/.test(this.git(args, s.worktree))) {
+        throw new Error("Binary changes require unsupported review coverage");
+      }
+    }
+    const diff = (args: string[]) => {
+      const bytes = execFileSync(
+        "git",
+        [
+          "diff",
+          "--no-color",
+          "--no-ext-diff",
+          "--no-textconv",
+          "--no-renames",
+          ...args,
+          s.baseRevision,
+        ],
+        { cwd: s.worktree, timeout: 30_000, maxBuffer: 8_000_000 },
+      );
+      if (!isUtf8(bytes)) {
+        throw new Error("Non-UTF-8 changes require unsupported review coverage");
+      }
+      return bytes.toString("utf8");
+    };
+    let text = `# Change manifest\n${JSON.stringify(this.changed(s))}\n\n# Working tree diff\n${diff([])}\n\n# Index diff\n${diff(["--cached"])}\n`;
+    const paths = this.git(["ls-files", "--others", "--exclude-standard", "-z"], s.worktree)
+      .split("\0")
+      .filter(Boolean);
+    for (const path of paths) {
+      const full = join(s.worktree, path);
+      const stat = lstatSync(full);
+      let content: string;
+      if (stat.isSymbolicLink()) {
+        content = `symlink -> ${readlinkSync(full)}`;
+      } else {
+        if (!stat.isFile() || stat.size > 8_000_000) {
+          throw new Error(`Unsupported review coverage: ${path}`);
+        }
+        const fd = openSync(full, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+        let bytes: Buffer;
+        try {
+          bytes = readFileSync(fd);
+        } finally {
+          closeSync(fd);
+        }
+        if (bytes.includes(0) || !isUtf8(bytes)) {
+          throw new Error(`Binary changes require unsupported review coverage: ${path}`);
+        }
+        content = bytes.toString("utf8");
+      }
+      text += `\n# New file ${JSON.stringify(path)}\n${content}\n`;
+      if (Buffer.byteLength(text) > 16_000_000) {
+        throw new Error("Review material exceeds supported coverage");
+      }
+    }
+    if (text.split("\n").some((line) => Buffer.byteLength(line) > 50 * 1024)) {
+      throw new Error("Review material contains an overlong line; unsupported review coverage");
+    }
+    return text;
+  }
+
   scope(s: Run, plan: Plan) {
     this.assertOwned(s);
     const extra = this.changed(s).filter(
       (p) => !plan.files.some((f) => (f.endsWith("/") ? p.startsWith(f) : p === f)),
     );
     if (extra.length) {
-      throw new Error(`Scope change requires renewed approval: ${extra.join(", ")}`);
+      throw new Error(`Scope change requires a validated plan revision: ${extra.join(", ")}`);
     }
   }
 
-  checkpoint(s: Run, plan: Plan) {
-    this.scope(s, plan);
-    if (!this.clean(s.worktree)) {
-      this.git(["add", "--all"], s.worktree);
-      this.git(
-        [
-          "-c",
-          "core.hooksPath=/dev/null",
-          "commit",
-          "-m",
-          `factory: ${plan.summary.slice(0, 120)}`,
-        ],
-        s.worktree,
-      );
+  finalize(s: Run, snapshot: string, subject: string) {
+    if (!validCommitSubject(subject)) {
+      throw new Error("Invalid final commit subject");
+    }
+    this.unchanged(s, s.baseRevision);
+    if (this.snapshot(s) !== snapshot) {
+      throw new Error("Candidate changed before finalization");
+    }
+    this.assertOwned(s);
+    const index = join(this.stateDir(), `index-${randomUUID()}`);
+    let expected: string;
+    try {
+      const temporaryGit = (args: string[]) =>
+        execFileSync("git", args, {
+          cwd: s.worktree,
+          env: { ...process.env, GIT_INDEX_FILE: index },
+          encoding: "utf8",
+          timeout: 30_000,
+          maxBuffer: 8_000_000,
+          stdio: ["ignore", "pipe", "pipe"],
+        }).trim();
+      temporaryGit(["read-tree", this.git(["write-tree"], s.worktree)]);
+      temporaryGit(["add", "--all"]);
+      expected = temporaryGit(["write-tree"]);
+    } finally {
+      if (existsSync(index)) {
+        unlinkSync(index);
+      }
+    }
+    if (this.snapshot(s) !== snapshot) {
+      throw new Error("Candidate changed during finalization");
+    }
+    this.git(["add", "--all"], s.worktree);
+    const tree = this.git(["write-tree"], s.worktree);
+    if (tree !== expected) {
+      throw new Error("Staged tree differs from accepted candidate");
+    }
+    if (tree === this.git(["rev-parse", `${s.baseRevision}^{tree}`], s.worktree)) {
+      return undefined;
+    }
+    this.git(["-c", "core.hooksPath=/dev/null", "commit", "-m", subject], s.worktree);
+    if (this.git(["rev-parse", "HEAD^{tree}"], s.worktree) !== tree || !this.clean(s.worktree)) {
+      throw new Error("Final commit does not match accepted candidate tree");
     }
     return this.head(s.worktree);
   }
 
   unchanged(s: Run, revision: string) {
     this.assertOwned(s);
-    if (this.head(s.worktree) !== revision || !this.clean(s.worktree)) {
-      throw new Error("Verification/review changed the revision or working tree; evidence invalid");
+    if (this.head(s.worktree) !== revision) {
+      throw new Error("Git revision changed; evidence invalid");
     }
   }
 }
@@ -271,7 +417,7 @@ export function validatePlan(value: unknown): Plan {
       file.includes("\0") ||
       file.startsWith("-")
     ) {
-      throw new Error("Invalid approved file path: " + file);
+      throw new Error("Invalid allowed file path: " + file);
     }
   }
   p.verification.forEach(validateCommand);

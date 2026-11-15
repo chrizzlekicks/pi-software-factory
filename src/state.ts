@@ -1,3 +1,6 @@
+export const MAX_REVIEW_FINDINGS = 64;
+export const MAX_TRIAGE_FINDINGS = 3 * MAX_REVIEW_FINDINGS + 2;
+
 import { randomUUID } from "node:crypto";
 import {
   mkdirSync,
@@ -9,14 +12,16 @@ import {
   fsyncSync,
   unlinkSync,
   existsSync,
+  linkSync,
+  readdirSync,
 } from "node:fs";
 import { join } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 
 import { validatePlan, validateCommand } from "./git.ts";
 
 export type Phase =
   | "planning"
-  | "awaiting_approval"
   | "implementing"
   | "testing"
   | "reviewing"
@@ -55,22 +60,22 @@ export type Evidence = {
 };
 
 export type Run = {
-  version: 1;
+  version: 1 | 2;
   id: string;
   request: string;
   repo: string;
   baseRevision: string;
   phase: Phase;
-  location?: "checkout";
-  recoverySnapshot?: string | undefined;
+  location?: "checkout" | "worktree";
+  candidateSnapshot?: string | undefined;
+  reviewPaths?: string[] | undefined;
+  noChanges?: boolean | undefined;
   pauseSnapshot?: string | undefined;
   planRevision: number;
   plans: Plan[];
-  approvedRevision?: number | undefined;
   branch: string;
   worktree?: string;
   delivery?: "github" | "local";
-  approvedDelivery?: "github" | "local" | undefined;
   target?: { repo: string; base: string; remote: string } | undefined;
   step: string;
   task: number;
@@ -90,20 +95,6 @@ export type Run = {
   deliveryIntent?: string | undefined;
   updated: number;
 };
-
-export function approvalMatches(s: Run) {
-  const target = s.target;
-  const validTarget =
-    !!target &&
-    [target.repo, target.base, target.remote].every((x) => typeof x === "string" && x.length > 0);
-  return (
-    s.approvedRevision === s.planRevision &&
-    (s.delivery === undefined && s.approvedDelivery === undefined
-      ? validTarget
-      : s.delivery === s.approvedDelivery &&
-        (s.delivery === "local" ? !target : s.delivery === "github" && validTarget))
-  );
-}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object";
@@ -132,7 +123,18 @@ export function validateFinalFindings(s: Run) {
   for (const role of ["quality", "security", "ponytail"]) {
     const reviews = current.filter((e) => e.role === role);
     const review = reviews[0]?.result;
-    if (reviews.length !== 1 || !isRecord(review) || !Array.isArray(review.findings)) {
+    const coverage = isRecord(review) ? review.coverage : undefined;
+    if (
+      reviews.length !== 1 ||
+      !isRecord(review) ||
+      !Array.isArray(review.findings) ||
+      review.findings.length > MAX_REVIEW_FINDINGS ||
+      !Array.isArray(coverage) ||
+      !s.reviewPaths ||
+      coverage.length !== s.reviewPaths.length ||
+      new Set(coverage).size !== s.reviewPaths.length ||
+      s.reviewPaths.some((path) => !coverage.includes(path))
+    ) {
       fail();
     }
     const reviewFindings: unknown[] = review.findings;
@@ -157,20 +159,22 @@ export function validateFinalFindings(s: Run) {
   if (new Set(originals.map((f) => f.id)).size !== originals.length) {
     fail();
   }
-  const triages = current.filter((e) => e.role === "triage");
-  if (!originals.length) {
-    if (triages.length || s.findings.length) {
-      fail();
-    }
-    return;
+  const audits = current.filter((e) => e.role === "docs");
+  if (audits.length !== 1 || !isRecord(audits[0]?.result) || audits[0].result.changes !== false) {
+    fail();
   }
+  const triages = current.filter((e) => e.role === "triage");
   if (triages.length !== 1) {
     fail();
   }
   const triage = triages[0]?.result;
   const findings: unknown = isRecord(triage) ? triage.findings : undefined;
   if (
+    !isRecord(triage) ||
+    triage.complete !== true ||
+    !text(triage.completionEvidence) ||
     !Array.isArray(findings) ||
+    findings.length > MAX_TRIAGE_FINDINGS ||
     findings.length !== originals.length ||
     findings.some((f: unknown) => !isRecord(f)) ||
     new Set(findings.filter(isRecord).map((f) => f.id)).size !== originals.length ||
@@ -203,7 +207,7 @@ function validateRunFields(s: unknown): asserts s is Run {
   const fail: () => never = invalidState;
   if (
     !isRecord(s) ||
-    s.version !== 1 ||
+    s.version !== 2 ||
     !text(s.id) ||
     !/^[0-9a-f-]{36}$/.test(s.id) ||
     !text(s.request) ||
@@ -212,7 +216,6 @@ function validateRunFields(s: unknown): asserts s is Run {
     s.branch !== "factory/" + s.id ||
     ![
       "planning",
-      "awaiting_approval",
       "implementing",
       "testing",
       "reviewing",
@@ -228,11 +231,10 @@ function validateRunFields(s: unknown): asserts s is Run {
     fail();
   }
   if (
-    (s.location !== undefined && s.location !== "checkout") ||
-    !optionalText(s.recoverySnapshot) ||
+    s.location !== "worktree" ||
     (s.pauseSnapshot !== undefined &&
       (typeof s.pauseSnapshot !== "string" || !/^[0-9a-f]{64}$/.test(s.pauseSnapshot))) ||
-    (s.location === "checkout" && s.worktree && s.worktree !== s.repo)
+    s.worktree === s.repo
   ) {
     fail();
   }
@@ -256,20 +258,9 @@ function validateRunFields(s: unknown): asserts s is Run {
     validatePlan(plan);
   }
   if (
-    s.approvedRevision !== undefined
-      ? s.approvedRevision !== s.planRevision ||
-        (s.delivery === undefined && s.approvedDelivery === undefined
-          ? !isRecord(s.target)
-          : s.delivery !== s.approvedDelivery) ||
-        s.plans.length !== s.planRevision
-      : s.approvedDelivery !== undefined
-  ) {
-    fail();
-  }
-  if (
     !integer(s.task) ||
     !integer(s.repairs) ||
-    s.repairs > 2 ||
+    s.repairs > 5 ||
     !integer(s.round) ||
     !integer(s.updated) ||
     !["documented", "paused", "cancelled"].every((k) => typeof s[k] === "boolean") ||
@@ -320,15 +311,8 @@ function validateRunFields(s: unknown): asserts s is Run {
     s.phase === "completed" &&
     (s.step !== "deliver" ||
       s.deliveryIntent ||
-      (s.delivery === "local"
-        ? !s.localReceipt
-        : !isRecord(s.pr) || !s.pr.draft || s.pr.head !== s.revision))
-  ) {
-    fail();
-  }
-  if (
-    s.phase === "awaiting_approval" &&
-    (s.plans.length !== s.planRevision || s.approvedRevision !== undefined)
+      (!s.noChanges &&
+        (s.delivery === "local" ? !s.localReceipt : !isRecord(s.pr) || s.pr.head !== s.revision)))
   ) {
     fail();
   }
@@ -339,10 +323,7 @@ function validateRunFields(s: unknown): asserts s is Run {
   ) {
     fail();
   }
-  if (
-    s.step === "deliver" &&
-    (!s.documented || !s.revision || s.approvedRevision !== s.planRevision)
-  ) {
+  if (s.step === "deliver" && (!s.documented || !s.revision)) {
     fail();
   }
   if (s.documented && !s.revision) {
@@ -358,7 +339,7 @@ function validateRunFields(s: unknown): asserts s is Run {
       "delivering",
       "completed",
     ].some((phase) => phase === s.phase) &&
-    (!s.worktree || s.approvedRevision !== s.planRevision)
+    (!s.worktree || s.plans.length !== s.planRevision)
   ) {
     fail();
   }
@@ -432,7 +413,10 @@ function validateRunFields(s: unknown): asserts s is Run {
     } else if (["quality", "security", "ponytail"].some((role) => role === e.role)) {
       if (
         typeof r.summary !== "string" ||
+        !Array.isArray(r.coverage) ||
+        r.coverage.some((path: unknown) => !text(path)) ||
         !Array.isArray(r.findings) ||
+        r.findings.length > MAX_REVIEW_FINDINGS ||
         r.findings.some(
           (f: unknown) =>
             !isRecord(f) || !text(f.id) || typeof f.blocking !== "boolean" || !text(f.evidence),
@@ -442,7 +426,10 @@ function validateRunFields(s: unknown): asserts s is Run {
       }
     } else if (e.role === "triage") {
       if (
+        typeof r.complete !== "boolean" ||
+        !text(r.completionEvidence) ||
         !Array.isArray(r.findings) ||
+        r.findings.length > MAX_TRIAGE_FINDINGS ||
         r.findings.some(
           (f: unknown) =>
             !isRecord(f) ||
@@ -481,7 +468,7 @@ function validateRunFields(s: unknown): asserts s is Run {
   }
 }
 
-function validateRun(s: unknown): asserts s is Run {
+export function validateRun(s: unknown): asserts s is Run {
   validateRunFields(s);
   const fail: () => never = invalidState;
   if (s.step === "deliver") {
@@ -530,6 +517,7 @@ export function atomic(path: string, value: unknown) {
 export class Store {
   dir: string;
   state?: Run;
+  legacy?: Record<string, unknown> | undefined;
   private lock: number | undefined;
 
   constructor(dir: string) {
@@ -548,14 +536,22 @@ export class Store {
     try {
       const path = join(dir, "state.json");
       if (existsSync(path)) {
-        this.state = JSON.parse(readFileSync(path, "utf8"));
-        validateRun(this.state);
+        const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+        if (isRecord(parsed) && parsed.version === 1) {
+          if (!text(parsed.id) || !/^[0-9a-f-]{36}$/.test(parsed.id) || !text(parsed.phase)) {
+            throw new Error("Invalid legacy factory state");
+          }
+          this.legacy = parsed;
+          return;
+        }
+        validateRun(parsed);
+        this.state = parsed;
         if (
           this.state.active ||
           this.state.deliveryIntent ||
           (!this.state.paused &&
             !this.state.cancelled &&
-            !["awaiting_approval", "completed", "failed", "blocked"].includes(this.state.phase))
+            !["completed", "failed", "blocked"].includes(this.state.phase))
         ) {
           this.state.phase = "blocked";
           this.state.error =
@@ -581,6 +577,52 @@ export class Store {
   }
 
   archive() {
+    if (this.legacy) {
+      const path = join(this.dir, String(this.legacy.id) + ".json");
+      const temp = path + "." + randomUUID() + ".tmp";
+      atomic(temp, this.legacy);
+      try {
+        const matches = (candidate: string) => {
+          try {
+            return isDeepStrictEqual(JSON.parse(readFileSync(candidate, "utf8")), this.legacy);
+          } catch (error) {
+            if (error instanceof SyntaxError) {
+              return false;
+            }
+            throw error;
+          }
+        };
+        try {
+          linkSync(temp, path);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+            throw error;
+          }
+          const prefix = String(this.legacy.id) + "-legacy-";
+          if (
+            !matches(path) &&
+            !readdirSync(this.dir).some(
+              (name) =>
+                name.startsWith(prefix) && name.endsWith(".json") && matches(join(this.dir, name)),
+            )
+          ) {
+            while (true) {
+              try {
+                linkSync(temp, join(this.dir, prefix + randomUUID() + ".json"));
+                break;
+              } catch (collision) {
+                if ((collision as NodeJS.ErrnoException).code !== "EEXIST") {
+                  throw collision;
+                }
+              }
+            }
+          }
+        }
+      } finally {
+        unlinkSync(temp);
+      }
+      this.legacy = undefined;
+    }
     if (this.state) {
       atomic(join(this.dir, this.state.id + ".json"), this.state);
     }

@@ -19,7 +19,7 @@ test("Berger display maps phases, deduplicates, and ignores missing executable",
   chmodSync(bin, 0o755);
   process.env.PATH = dir + ":" + previous;
   const display = bergerDisplay();
-  const state = { phase: "awaiting_approval" as const, paused: false, cancelled: false };
+  const state = { phase: "implementing" as const, paused: true, cancelled: false };
   display(state);
   display(state);
   for (let i = 0; i < 100 && !existsSync(output); i++) {

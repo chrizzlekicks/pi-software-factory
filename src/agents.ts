@@ -6,6 +6,7 @@ import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 import type { Agents } from "./controller.ts";
+import { MAX_TRIAGE_FINDINGS } from "./state.ts";
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === "object";
@@ -19,6 +20,12 @@ const object = (properties: Record<string, unknown>, required = Object.keys(prop
 const text = { type: "string" },
   flag = { type: "boolean" };
 const texts = { type: "array", items: text, maxItems: 64 };
+const coverage = {
+  type: "array",
+  items: text,
+  description:
+    "Only exact repository-relative changed paths fully reviewed; no descriptions or context paths.",
+};
 const command = object({ command: text, args: texts, purpose: text });
 const finding = object(
   { id: text, blocking: flag, evidence: text, confirmed: flag, reproduction: command },
@@ -56,15 +63,32 @@ export const roles: Record<
     readOnly: false,
     schema: object({ passed: flag, summary: text, commands: { type: "array", items: command } }),
   },
-  quality: { agent: "reviewer", readOnly: true, schema: object({ summary: text, findings }) },
-  security: { agent: "reviewer", readOnly: true, schema: object({ summary: text, findings }) },
+  quality: {
+    agent: "reviewer",
+    readOnly: true,
+    schema: object({ summary: text, findings, coverage }),
+  },
+  security: {
+    agent: "reviewer",
+    readOnly: true,
+    schema: object({ summary: text, findings, coverage }),
+  },
   ponytail: {
     agent: "reviewer",
     readOnly: true,
     skill: "ponytail-review",
-    schema: object({ summary: text, findings }),
+    schema: object({ summary: text, findings, coverage }),
   },
-  triage: { agent: "reviewer", readOnly: true, schema: object({ findings }) },
+  triage: {
+    agent: "reviewer",
+    readOnly: true,
+    schema: object({
+      findings: { ...findings, maxItems: MAX_TRIAGE_FINDINGS },
+      complete: flag,
+      completionEvidence: text,
+      commitSubject: text,
+    }),
+  },
   docs: { agent: "docs-auditor", readOnly: true, schema: object({ summary: text, changes: flag }) },
 };
 

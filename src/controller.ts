@@ -1,9 +1,15 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, writeFileSync } from "node:fs";
+import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { Git, execute, validatePlan } from "./git.ts";
-import { Store, validateFinalFindings, approvalMatches } from "./state.ts";
+import { Git, execute, validatePlan, validCommitSubject } from "./git.ts";
+import {
+  Store,
+  validateFinalFindings,
+  validateRun,
+  MAX_REVIEW_FINDINGS,
+  MAX_TRIAGE_FINDINGS,
+} from "./state.ts";
 import type { Run, Phase, Plan, Finding, Command } from "./state.ts";
 
 export interface Agents {
@@ -20,6 +26,7 @@ export interface Agents {
 export interface Delivery {
   preflight(): Promise<Run["target"]>;
   deliver(state: Run, report: string, boundary: () => void): Promise<NonNullable<Run["pr"]>>;
+  reconcile?(state: Run, boundary: () => void, completed: boolean): Promise<NonNullable<Run["pr"]>>;
 }
 
 export class Factory {
@@ -49,6 +56,11 @@ export class Factory {
 
   get state() {
     if (!this.store.state) {
+      if (this.store.legacy) {
+        throw new Error(
+          "Legacy factory state cannot resume automatically; inspect preserved artifacts and start a fresh run",
+        );
+      }
       throw new Error("No factory run");
     }
     return this.store.state;
@@ -70,31 +82,45 @@ export class Factory {
     }
   }
 
-  async plan(request: string, delivery: "github" | "local" = "local") {
+  async request(request: string, delivery?: "github" | "local") {
+    await this.plan(request, delivery);
+    await this.drive();
+  }
+
+  async plan(request: string, delivery?: "github" | "local") {
     this.idle();
     if (!request.trim()) {
       throw new Error("A development request is required");
     }
     const old = this.store.state;
+    if (this.store.legacy?.active || this.store.legacy?.deliveryIntent) {
+      throw new Error(
+        "Legacy run has an uncertain operation; inspect the preserved state and confirm all children stopped before starting a fresh run",
+      );
+    }
     if (old?.active || old?.deliveryIntent) {
       throw new Error("Prior operation is uncertain; reconcile before starting a new run");
     }
-    if (
-      old &&
-      !["completed", "failed"].includes(old.phase) &&
-      !old.cancelled &&
-      old.phase !== "awaiting_approval"
-    ) {
+    if (old && !["completed", "failed"].includes(old.phase) && !old.cancelled) {
       throw new Error("Active run exists; inspect or cancel it first");
     }
-    if (!this.git.clean()) {
-      throw new Error("Start from a clean repository; user changes are never stashed or discarded");
+    if (delivery === undefined) {
+      const hasOrigin = this.git.git(["remote"]).split("\n").includes("origin");
+      const origin = hasOrigin ? this.git.git(["remote", "get-url", "origin"]) : "";
+      delivery =
+        /^(?:[a-z][a-z0-9+.-]*:\/\/(?:[^/@]+@)?github\.com(?=[:/]|$)|(?:[^/@:]+@)?github\.com:)/i.test(
+          origin,
+        )
+          ? "github"
+          : "local";
     }
+    const baseRevision = this.git.head();
+    const startingBranch =
+      delivery === "github" ? this.git.git(["symbolic-ref", "--short", "HEAD"]) : undefined;
     this.pauseWanted = false;
     this.cancelWanted = false;
     this.running = true;
     try {
-      await this.agents.preflight(this.git.repo);
       if (delivery !== "github" && delivery !== "local") {
         throw new Error("Invalid delivery mode");
       }
@@ -105,16 +131,22 @@ export class Factory {
         }
       }
       const target = delivery === "github" ? await this.delivery.preflight() : undefined;
+      if (delivery === "github" && !target) {
+        throw new Error("GitHub preflight did not provide a delivery target");
+      }
+      if (target && target.base !== startingBranch) {
+        throw new Error("Starting branch changed before GitHub preflight");
+      }
       this.boundary();
       this.store.archive();
       const id = randomUUID();
       this.store.state = {
-        version: 1,
-        location: "checkout",
+        version: 2,
+        location: "worktree",
         id,
         request,
         repo: this.git.repo,
-        baseRevision: this.git.head(),
+        baseRevision,
         phase: "planning",
         planRevision: 1,
         plans: [],
@@ -133,19 +165,26 @@ export class Factory {
         findings: [],
         updated: Date.now(),
       };
+      this.state.active = { role: "worktree-create", requestId: randomUUID(), started: Date.now() };
       this.save();
+      this.state.worktree = this.git.create(this.state);
+      this.state.revision = baseRevision;
+      this.state.active = undefined;
+      this.save();
+      await this.agents.preflight(this.checkout(this.state));
+      const snapshot = this.git.snapshot(this.state);
       const plan = validatePlan(
         await this.agent(
           "planner",
-          `Delegate repository inspection to scout and, when useful, web research to researcher, instructing it to call web_enable first. Do not implement changes. Plan this request: ${request}\nReturn dependencies, risks, exact allowed file paths (directory prefixes end in /), ordered tasks and concrete build/test/black-box verification commands as executable + argv. Include documentation paths. Propose at least one task, file path and verification command; these are proposals for human approval, not already-approved scope. No implementation.`,
+          `Delegate repository inspection to scout and, when useful, web research to researcher, instructing it to call web_enable first. Do not implement changes. Plan this request: ${request}\nReturn dependencies, risks, exact allowed file paths (directory prefixes end in /), ordered tasks and concrete build/test/black-box verification commands as executable + argv. Include documentation paths. Propose at least one task, file path and verification command; make reasonable assumptions and record them in risks. No implementation.`,
         ),
       );
       this.boundary();
-      if (!this.git.clean() || this.git.head() !== this.state.baseRevision) {
-        throw new Error("Planner changed repository");
+      if (this.git.snapshot(this.state) !== snapshot) {
+        throw new Error("Planner changed worktree");
       }
       this.state.plans.push(plan);
-      this.save("awaiting_approval");
+      this.save("implementing");
     } catch (e) {
       if (this.store.state && this.store.state !== old) {
         this.state.error = String(e);
@@ -156,76 +195,12 @@ export class Factory {
           this.state.paused = true;
         }
         this.save("failed");
+        writeFileSync(join(this.store.dir, "report.md"), this.report(), { mode: 0o600 });
       }
       throw e;
     } finally {
       this.running = false;
     }
-  }
-
-  reject() {
-    this.idle();
-    if (this.state.phase !== "awaiting_approval") {
-      throw new Error("No plan awaiting approval");
-    }
-    this.state.approvedRevision = undefined;
-    this.state.approvedDelivery = undefined;
-    this.state.cancelled = true;
-    this.state.error = "Plan rejected; submit a revised request";
-    this.save("blocked");
-  }
-
-  async approve() {
-    this.idle();
-    const s = this.state;
-    if (s.phase !== "awaiting_approval" || s.cancelled || s.active) {
-      throw new Error("No current plan awaiting approval");
-    }
-    const plan = validatePlan(s.plans.at(-1));
-    if (s.location !== "checkout") {
-      throw new Error("Legacy execution location: inspect original worktree and recover manually");
-    }
-    if (
-      s.worktree
-        ? !s.recoverySnapshot || this.git.snapshot(s) !== s.recoverySnapshot
-        : this.git.head() !== s.baseRevision || !this.git.clean()
-    ) {
-      throw new Error("Repository changed since planning; inspect and replan");
-    }
-    await this.agents.preflight(s.worktree ?? s.repo);
-    this.boundary();
-    if (s.cancelled || s.paused) {
-      throw new Error("Stop requested during approval");
-    }
-    if (s.worktree) {
-      if (this.git.snapshot(s) !== s.recoverySnapshot) {
-        throw new Error("Checkout changed during approval");
-      }
-      this.git.scope(s, plan);
-    }
-    s.approvedRevision = s.planRevision;
-    s.approvedDelivery = s.delivery ?? "github";
-    s.delivery ??= "github";
-    s.active = {
-      role: s.worktree ? "checkpoint" : "branch-create",
-      requestId: randomUUID(),
-      started: Date.now(),
-    };
-    this.save("blocked");
-    if (!s.worktree) {
-      s.worktree = this.git.create(s);
-      s.revision = s.baseRevision;
-      s.active = undefined;
-      this.save();
-    } else {
-      s.revision = this.git.checkpoint(s, plan);
-      s.recoverySnapshot = undefined;
-      s.active = undefined;
-      this.save();
-    }
-    s.paused = false;
-    s.error = undefined;
-    this.save("implementing");
   }
 
   private recordPause() {
@@ -270,9 +245,6 @@ export class Factory {
     if (s.cancelled || ["completed", "failed"].includes(s.phase)) {
       throw new Error("Cancelled or terminal run cannot resume");
     }
-    if (!approvalMatches(s)) {
-      throw new Error("Plan approval required");
-    }
     if (s.phase === "blocked" && !s.paused) {
       throw new Error("Quality gate blocked; inspect findings, do not bypass it");
     }
@@ -290,105 +262,104 @@ export class Factory {
     this.save();
   }
 
-  // Explicitly adopt an inspected interrupted checkout, but never assume the task completed.
-  async replanAfterInterruption() {
+  async deliver() {
     this.idle();
     const s = this.state;
-    const initialPlanner =
-      !s.worktree &&
-      s.location === "checkout" &&
-      (s.active?.role === "planner" ||
-        (!s.active && (s.phase === "failed" || s.phase === "blocked"))) &&
-      s.plans.length === 0 &&
-      !s.approvedRevision &&
-      !s.deliveryIntent;
-    const exhaustedQualityGate =
-      s.phase === "blocked" &&
-      s.step === "verify" &&
-      s.repairs >= 2 &&
-      s.error === "Error: Two repair cycles exhausted; human intervention required" &&
-      s.findings.some((f) => f.blocking && f.confirmed);
+    const completed = s.phase === "completed";
     if (
-      !initialPlanner &&
-      (!s.worktree ||
-        (!s.active && !s.paused && !exhaustedQualityGate) ||
-        s.cancelled ||
-        s.deliveryIntent)
+      s.active ||
+      s.cancelled ||
+      s.noChanges ||
+      s.step !== "deliver" ||
+      (!completed && (s.phase !== "blocked" || !s.deliveryIntent)) ||
+      (completed && s.deliveryIntent)
     ) {
       throw new Error(
-        "Uncertain Git/delivery operation needs manual reconciliation; artifacts preserved",
+        "Delivery retry requires a finalized delivery intent or completed receipt and no uncertain child",
       );
     }
-    if (initialPlanner) {
-      if (s.repo !== this.git.repo || !this.git.clean() || this.git.head() !== s.baseRevision) {
-        throw new Error("Repository changed since planning; inspect and reconcile manually");
+    validateRun(s);
+    const revision = this.currentRevision(s);
+    if (
+      !s.candidateSnapshot ||
+      revision === s.baseRevision ||
+      this.git.git(["rev-list", "--parents", "-n", "1", revision], this.checkout(s)) !==
+        `${revision} ${s.baseRevision}`
+    ) {
+      throw new Error("Missing finalization evidence or invalid final commit parent");
+    }
+    const verify = () => {
+      this.git.unchanged(s, revision);
+      if (!this.git.clean(this.checkout(s))) {
+        throw new Error("Delivery worktree is dirty");
       }
-    } else {
-      this.git.assertOwned(s);
+      this.finalGate(true);
+    };
+    verify();
+    if (s.paused && (!s.pauseSnapshot || this.git.snapshot(s) !== s.pauseSnapshot)) {
+      throw new Error("Paused checkout changed or snapshot unavailable; inspect and replan");
     }
-    if (s.paused) {
-      this.pauseWanted = false;
-    }
-    if (initialPlanner) {
-      this.cancelWanted = false;
-    }
+    this.pauseWanted = false;
+    s.paused = false;
+    s.pauseSnapshot = undefined;
+    const mode = s.delivery;
+    const target = JSON.stringify(s.target);
     this.running = true;
     try {
-      await this.agents.preflight(s.worktree ?? s.repo);
-      this.boundary();
-      const snapshot = initialPlanner ? undefined : this.git.snapshot(s);
-      if (initialPlanner) {
-        if (!this.git.clean() || this.git.head() !== s.baseRevision) {
-          throw new Error("Repository changed since planning; inspect and reconcile manually");
+      if (!completed) {
+        s.deliveryIntent = revision;
+        this.save();
+      }
+      const boundary = () => {
+        this.boundary();
+        verify();
+        if (s.delivery !== mode || JSON.stringify(s.target) !== target) {
+          throw new Error("Delivery target changed");
         }
-        if (!existsSync(join(this.store.dir, s.id + ".json"))) {
-          this.store.archive();
+      };
+      if (mode === "local") {
+        if (s.target || s.pr) {
+          throw new Error("Invalid local delivery state");
         }
-        s.cancelled = false;
-        this.cancelWanted = false;
+        const receipt = { revision, branch: s.branch, worktree: this.checkout(s) };
+        if (s.localReceipt && JSON.stringify(s.localReceipt) !== JSON.stringify(receipt)) {
+          throw new Error("Local receipt mismatch");
+        }
+        s.localReceipt = receipt;
+      } else {
+        if (!this.delivery.reconcile) {
+          throw new Error("Delivery reconciliation unavailable");
+        }
+        const receipt = await this.delivery.reconcile(s, boundary, completed);
+        boundary();
+        if (s.pr && (s.pr.url !== receipt.url || s.pr.head !== receipt.head)) {
+          throw new Error("PR receipt mismatch");
+        }
+        if (!completed) {
+          s.pr = receipt;
+        }
       }
-      s.approvedRevision = undefined;
-      s.approvedDelivery = undefined;
-      if (!initialPlanner) {
-        s.active = undefined;
+      if (!completed) {
+        this.save(); // Persist the receipt while the intent still protects recovery.
+        s.deliveryIntent = undefined;
+        s.error = undefined;
+        this.save("completed");
       }
-      s.paused = false;
-      s.pauseSnapshot = undefined;
-      s.error = undefined;
-      s.step = "implement";
-      s.task = 0;
-      s.documented = false;
-      this.save("planning");
-      const plan = validatePlan(
-        await this.agent(
-          "planner",
-          `Recovery: human has inspected the stopped execution and confirmed no child is still running. Existing work must be preserved; do NOT assume interrupted tasks completed. Delegate current checkout inspection to scout and, when useful, web research to researcher, instructing it to call web_enable first. Plan remaining work for request ${s.request}. Propose at least one task, file path and verification command for human approval. Include ALL changed paths since ${s.baseRevision} in the proposed allowed files.`,
-        ),
-      );
-      this.boundary();
-      if (
-        initialPlanner
-          ? !this.git.clean() || this.git.head() !== s.baseRevision
-          : this.git.snapshot(s) !== snapshot
-      ) {
-        throw new Error("Checkout changed during recovery planning");
-      }
-      s.recoverySnapshot = snapshot;
-      s.plans.push(plan);
-      if (!initialPlanner) {
-        s.planRevision++;
-      }
-      s.round++;
-      this.save("awaiting_approval");
+      writeFileSync(join(this.store.dir, "report.md"), this.report(), { mode: 0o600 });
     } catch (e) {
-      s.error = String(e);
-      if (this.cancelWanted) {
-        s.cancelled = true;
-        s.paused = true;
-      } else if (this.pauseWanted) {
-        s.paused = true;
+      if (!completed) {
+        s.deliveryIntent = revision;
+        s.error = `Delivery retry: ${String(e)}`;
+        if (this.cancelWanted) {
+          s.cancelled = true;
+          s.paused = true;
+        } else if (this.pauseWanted) {
+          this.recordPause();
+          this.pauseWanted = false;
+        }
+        this.save("blocked");
+        writeFileSync(join(this.store.dir, "report.md"), this.report(), { mode: 0o600 });
       }
-      this.save("blocked");
       throw e;
     } finally {
       this.running = false;
@@ -414,7 +385,7 @@ export class Factory {
   private checkout(s: Run): string {
     const worktree = s.worktree;
     if (!worktree) {
-      throw new Error("No approved checkout");
+      throw new Error("No isolated checkout");
     }
     return worktree;
   }
@@ -437,13 +408,13 @@ export class Factory {
     this.save();
     this.abort = new AbortController();
     const revision = s.worktree ? this.git.head(s.worktree) : s.baseRevision;
-    const result = await this.agents.run(
-      role,
-      task,
-      s.worktree ?? s.repo,
-      identity,
-      this.abort.signal,
-    );
+    const readonly = ["tester", "quality", "security", "ponytail", "docs", "triage"].includes(role);
+    const snapshot = readonly ? this.git.snapshot(s) : undefined;
+    const result = await this.agents.run(role, task, this.checkout(s), identity, this.abort.signal);
+    if (readonly && this.git.snapshot(s) !== snapshot) {
+      throw new Error(`${role} changed the candidate; evidence invalid`);
+    }
+    this.git.unchanged(s, revision);
     s.executions.push({ role, revision, round: s.round, result, at: Date.now() });
     s.active = undefined;
     this.abort = undefined;
@@ -457,32 +428,53 @@ export class Factory {
     const before = this.git.head(this.checkout(s));
     const result = (await this.agent(
       role,
-      `${task}\nApproved plan revision ${s.planRevision}: ${JSON.stringify(this.planValue)}\nStay strictly within approved scope. If scope must change, stop and return scopeChange. Never commit, push, create PRs, change branches/worktrees, alter Git metadata, or weaken verification. Preserve existing changes. Return summary and scopeChange (empty when none).`,
+      `${task}\nCurrent validated plan revision ${s.planRevision}: ${JSON.stringify(this.planValue)}\nReport necessary scope changes in scopeChange. Install project-defined dependencies if needed. Never commit, push, create PRs, change branches/worktrees, alter Git metadata, or weaken verification. Preserve existing changes. Return summary and scopeChange (empty when none).`,
     )) as { summary: string; scopeChange: string };
     if (this.git.head(this.checkout(s)) !== before) {
-      s.approvedRevision = undefined;
-      s.approvedDelivery = undefined;
       throw new Error("Worker changed Git HEAD; inspect before recovery");
     }
     if (!result || typeof result.summary !== "string" || typeof result.scopeChange !== "string") {
       throw new Error("Invalid worker outcome");
     }
-    if (result.scopeChange) {
-      s.approvedRevision = undefined;
-      s.approvedDelivery = undefined;
-      throw new Error("Scope change requires renewed approval: " + result.scopeChange);
+    const extra = this.git
+      .changed(s)
+      .filter(
+        (path) =>
+          !this.planValue.files.some((f) => (f.endsWith("/") ? path.startsWith(f) : path === f)),
+      );
+    if (result.scopeChange || extra.length) {
+      if (role !== "repair") {
+        if (s.repairs >= 5) {
+          throw new Error("Five repair cycles exhausted during scope revision");
+        }
+        s.repairs++;
+      }
+      const snapshot = this.git.snapshot(s);
+      const previous = this.planValue;
+      const revised = validatePlan(
+        await this.agent(
+          "planner",
+          `READ ONLY revise scope and verification for request ${s.request}. Existing plan: ${JSON.stringify(previous)}. Changed paths: ${JSON.stringify(this.git.changed(s))}. Requested revision: ${result.scopeChange}. Include every changed path; preserve or strengthen verification. Do not edit.`,
+        ),
+      );
+      if (this.git.snapshot(s) !== snapshot) {
+        throw new Error("Planner changed the candidate during scope revision");
+      }
+      if (
+        previous.verification.some(
+          (old) =>
+            !revised.verification.some((next) => JSON.stringify(next) === JSON.stringify(old)),
+        )
+      ) {
+        throw new Error("Scope revision removed an existing verification command");
+      }
+      revised.tasks = previous.tasks;
+      validatePlan(revised);
+      this.git.scope(s, revised);
+      s.plans.push(revised);
+      s.planRevision++;
     }
-    try {
-      this.git.scope(s, this.planValue);
-    } catch (e) {
-      s.approvedRevision = undefined;
-      s.approvedDelivery = undefined;
-      throw e;
-    }
-    s.active = { role: "checkpoint", requestId: randomUUID(), started: Date.now() };
-    this.save();
-    s.revision = this.git.checkpoint(s, this.planValue);
-    s.active = undefined;
+    this.git.unchanged(s, s.baseRevision);
     this.save();
   }
 
@@ -503,7 +495,11 @@ export class Factory {
     s.active = { role: "verification-command", requestId: randomUUID(), started: Date.now() };
     this.save();
     this.abort = new AbortController();
+    const snapshot = this.git.snapshot(s);
     const result = await execute(c.command, c.args, this.checkout(s), this.abort.signal);
+    if (this.git.snapshot(s) !== snapshot) {
+      throw new Error("Verification command changed the candidate; evidence invalid");
+    }
     s.active = undefined;
     this.abort = undefined;
     this.git.unchanged(s, this.currentRevision(s));
@@ -517,7 +513,7 @@ export class Factory {
     this.git.unchanged(s, this.currentRevision(s));
     const result = (await this.agent(
       "tester",
-      `Independently verify revision ${s.revision}. Run all approved commands: ${JSON.stringify(this.planValue.verification)}. Include build, tests and black-box smoke tests as applicable. Do not edit tracked files/install dependencies or weaken tests. Return passed, summary, commands actually run. Missing verification is a failure.`,
+      `Independently verify revision ${s.revision}. Run all validated commands: ${JSON.stringify(this.planValue.verification)}. Include build, tests and black-box smoke tests as applicable. Do not edit tracked files/install dependencies or weaken tests. Return passed, summary, commands actually run. Missing verification is a failure.`,
     )) as { passed: boolean; summary: string; commands: Command[] };
     this.git.unchanged(s, this.currentRevision(s));
     if (
@@ -543,6 +539,14 @@ export class Factory {
     const s = this.state;
     this.save("reviewing");
     const findings: Finding[] = [];
+    const paths = this.git.changed(s);
+    s.reviewPaths = paths;
+    this.save();
+    const material = join(this.store.dir, `review-${s.id}-${s.round}.md`);
+    writeFileSync(material, this.git.reviewText(s), { mode: 0o600 });
+    if (this.git.snapshot(s) !== s.candidateSnapshot) {
+      throw new Error("Candidate changed while preparing review");
+    }
     for (const role of ["quality", "security", "ponytail"]) {
       const focus =
         role === "quality"
@@ -550,13 +554,36 @@ export class Factory {
           : role === "security"
             ? "correctness, security, silent bugs and edge cases"
             : "the installed ponytail-review skill: independently review correctness, safety, load, tests and unnecessary code";
-      // oxlint-disable-next-line no-await-in-loop -- Persist each review's active request and evidence before starting the next role.
-      const r = (await this.agent(
-        role,
-        `Independent adversarial READ-ONLY review of ${s.worktree}, exact HEAD ${s.revision}, changes from ${s.baseRevision}. Focus on ${focus}. Read the changed and connected code (not just successful agent responses). Approved plan: ${JSON.stringify(this.planValue)}. Return summary and findings with unique id, blocking boolean and concrete evidence/file paths. No shell or edits.`,
-      )) as { summary: string; findings: Finding[] };
-      this.git.unchanged(s, this.currentRevision(s));
-      validateFindings(r?.findings);
+      let correction = "";
+      let r: { summary: string; findings: Finding[]; coverage: string[] };
+      while (true) {
+        // oxlint-disable-next-line no-await-in-loop -- Each attempt is checked and persisted before the next.
+        r = (await this.agent(
+          role,
+          `Independent adversarial READ-ONLY review of ${s.worktree}, changes from ${s.baseRevision}. Focus on ${focus}. Read the entire review material at ${material}, using read offsets and limits to page large text, and inspect connected code. Fully inspect every changed path: ${JSON.stringify(paths)}. Plan: ${JSON.stringify(this.planValue)}. Return summary, findings with unique id, blocking boolean and concrete evidence/file paths. Coverage must contain only the exact repository-relative changed path strings, each once, with no descriptions, artifact paths or context paths; mention context separately in summary or findings. Never claim coverage of unreadable or uninspected material. No shell or edits. ${correction}`,
+        )) as { summary: string; findings: Finding[]; coverage: string[] };
+        this.git.unchanged(s, this.currentRevision(s));
+        if (this.git.snapshot(s) !== s.candidateSnapshot) {
+          throw new Error("Candidate changed during review; evidence invalid");
+        }
+        validateFindings(r?.findings);
+        if (typeof r.summary !== "string") {
+          throw new Error(`Invalid ${role} review summary`);
+        }
+        const coverage = Array.isArray(r.coverage) ? r.coverage : [];
+        const missing = paths.filter((p) => !coverage.includes(p));
+        const invalid = coverage.filter((p, i) => !paths.includes(p) || coverage.indexOf(p) !== i);
+        if (Array.isArray(r.coverage) && !missing.length && !invalid.length) {
+          break;
+        }
+        const diagnostic = `Incomplete ${role} review coverage: expected ${JSON.stringify(paths)}; missing ${JSON.stringify(missing)}; invalid or duplicate ${JSON.stringify(invalid)}${Array.isArray(r.coverage) ? "" : "; coverage is not an array"}`;
+        if (s.repairs >= 5) {
+          throw new Error(`${diagnostic}; five repair cycles exhausted`);
+        }
+        s.repairs++;
+        this.save();
+        correction = `Previous response was invalid: ${diagnostic}. Reinspect the material and changed paths before responding; do not invent coverage. If anything is unreadable or uninspected, omit it from coverage.`;
+      }
       this.evidence(role, r);
       findings.push(...r.findings.map((f) => ({ ...f, id: role + ":" + f.id })));
     }
@@ -573,18 +600,44 @@ export class Factory {
         evidence: "Independent test gate failed",
       });
     }
-    if (!findings.length) {
-      s.findings = [];
-      this.save();
-      return false;
-    }
+    const evidence = s.evidence
+      .filter((e) => e.round === s.round)
+      .map((e, index) => {
+        const result = isRecord(e.result) ? e.result : {};
+        if (e.role === "command") {
+          const artifact = join(this.store.dir, `command-${s.id}-${s.round}-${index}.jsonl`);
+          const lines: string[] = [];
+          for (const stream of ["stdout", "stderr"] as const) {
+            const output = typeof result[stream] === "string" ? result[stream] : "";
+            for (let offset = 0; offset < output.length || offset === 0; offset += 4000) {
+              lines.push(
+                JSON.stringify({ stream, offset, text: output.slice(offset, offset + 4000) }),
+              );
+            }
+          }
+          writeFileSync(artifact, lines.join("\n") + "\n", { mode: 0o600 });
+          return { role: e.role, command: result.command, code: result.code, artifact };
+        }
+        return { role: e.role, passed: result.passed, changes: result.changes };
+      });
     const result = (await this.agent(
       "triage",
-      `READ ONLY consolidate and triage these findings: ${JSON.stringify(findings)}. Confirm suspected defects with concrete source evidence. Reject only with explicit contradictory evidence. Return EVERY original id exactly once, blocking, confirmed boolean, evidence, and optional reproduction executable/argv using ONLY an approved verification command from ${JSON.stringify(this.planValue.verification)}. Test-failure cannot be rejected. No edits or shell.`,
-    )) as { findings: Finding[] };
+      `READ ONLY determine whether the full request is complete, with concrete completionEvidence. Provide commitSubject describing the actual full verified task delta, not the request or plan title: one meaningful Conventional Commits line, type[(scope)][!]: description, at most 72 characters; type must be docs, fix, feat, refactor, test, chore, build, ci, perf, revert or style. Base it on the complete change material and verification evidence. Request: ${s.request}. Plan: ${JSON.stringify(this.planValue)}. Changed paths: ${JSON.stringify(this.git.changed(s))}. Complete paged change material: ${join(this.store.dir, `review-${s.id}-${s.round}.md`)}. Verification and review status: ${JSON.stringify(evidence)}. Command output artifacts contain ordered JSON lines with stream, character offset, and text; page with read offsets and limits. Consolidate these findings: ${JSON.stringify(findings)}. Confirm suspected defects with concrete source evidence. Reject only with explicit contradictory evidence. Return EVERY original id exactly once, blocking, confirmed boolean, evidence, and optional reproduction executable/argv using ONLY a planned verification command from ${JSON.stringify(this.planValue.verification)}. Test-failure cannot be rejected. No edits or shell.`,
+    )) as {
+      findings: Finding[];
+      complete: boolean;
+      completionEvidence: string;
+      commitSubject: string;
+    };
     this.git.unchanged(s, this.currentRevision(s));
-    validateFindings(result?.findings);
+    if (!validCommitSubject(result?.commitSubject)) {
+      throw new Error("Invalid final commit subject; gate remains closed");
+    }
+    validateFindings(result?.findings, MAX_TRIAGE_FINDINGS);
     if (
+      typeof result.complete !== "boolean" ||
+      typeof result.completionEvidence !== "string" ||
+      !result.completionEvidence.trim() ||
       result.findings.length !== findings.length ||
       new Set(result.findings.map((f) => f.id)).size !== findings.length ||
       findings.some((f) => !result.findings.some((r) => r.id === f.id)) ||
@@ -593,7 +646,7 @@ export class Factory {
       throw new Error("Incomplete triage; gate remains closed");
     }
     for (const f of result.findings) {
-      if (f.id === "test-failure") {
+      if (f.id === "test-failure" || f.id === "docs-audit") {
         f.blocking = true;
         f.confirmed = true;
       }
@@ -612,29 +665,38 @@ export class Factory {
             JSON.stringify(candidate.args) === JSON.stringify(reproduction.args),
         );
         if (!c) {
-          throw new Error("Reproduction command needs renewed approval");
+          throw new Error("Reproduction command is outside the validated plan");
         }
         // oxlint-disable-next-line no-await-in-loop -- Persist each reproduction before executing the next finding's command.
         this.evidence("reproduction", { id: f.id, result: await this.command(c) });
       }
     }
-    s.findings = result.findings;
+    s.findings = [...result.findings];
     this.evidence("triage", result);
-    return s.findings.some((f) => f.confirmed && f.blocking);
+    if (!result.complete) {
+      s.findings.push({
+        id: "task-incomplete",
+        blocking: true,
+        confirmed: true,
+        evidence: result.completionEvidence,
+      });
+    }
+    return !result.complete || s.findings.some((f) => f.confirmed && f.blocking);
   }
 
   async drive() {
     this.idle();
     const s = this.state;
     if (
-      !approvalMatches(s) ||
       s.active ||
       s.cancelled ||
       s.paused ||
-      ["completed", "failed", "blocked", "awaiting_approval"].includes(s.phase)
+      ["completed", "failed", "blocked"].includes(s.phase)
     ) {
-      throw new Error("Run is not approved and runnable");
+      throw new Error("Run is not runnable");
     }
+    const delivery = s.delivery;
+    const target = JSON.stringify(s.target);
     this.running = true;
     try {
       while (true) {
@@ -650,8 +712,8 @@ export class Factory {
           this.save();
           return;
         }
-        if (!approvalMatches(s)) {
-          throw new Error("Approval invalidated");
+        if (s.delivery !== delivery || JSON.stringify(s.target) !== target) {
+          throw new Error("Delivery selection changed during execution");
         }
         this.git.unchanged(s, this.currentRevision(s));
         if (s.step === "implement") {
@@ -671,21 +733,47 @@ export class Factory {
           this.save();
         } else if (s.step === "verify") {
           s.round++;
+          s.candidateSnapshot = this.git.snapshot(s);
           this.save();
           // oxlint-disable-next-line no-await-in-loop -- Verification must finish before reviews consume its evidence.
           const passed = await this.tests();
           // oxlint-disable-next-line no-await-in-loop -- Reviews follow verification and finish before triage.
           const findings = await this.reviews();
+          this.save("documenting");
+          // oxlint-disable-next-line no-await-in-loop -- Audit the same candidate as the other gates.
+          const docs = (await this.agent(
+            "docs",
+            `READ ONLY audit documentation against request ${s.request} and the full implementation. Return summary and whether changes are needed. No edits or shell.`,
+          )) as { summary: string; changes: boolean };
+          this.git.unchanged(s, this.currentRevision(s));
+          if (
+            !docs ||
+            typeof docs.summary !== "string" ||
+            typeof docs.changes !== "boolean" ||
+            (docs.changes && !docs.summary.trim())
+          ) {
+            throw new Error("Invalid documentation audit");
+          }
+          this.evidence("docs", docs);
+          s.documented = !docs.changes;
+          if (docs.changes) {
+            findings.push({
+              id: "docs-audit",
+              blocking: true,
+              confirmed: true,
+              evidence: docs.summary,
+            });
+          }
           // oxlint-disable-next-line no-await-in-loop -- Triage depends on completed tester and reviewer evidence.
           if (await this.triage(findings, passed)) {
-            if (s.repairs >= 2) {
-              throw new Error("Two repair cycles exhausted; human intervention required");
+            if (s.repairs >= 5) {
+              throw new Error("Five repair cycles exhausted");
             }
             s.step = "repair";
             this.save();
             continue;
           }
-          s.step = s.documented ? "deliver" : "docs";
+          s.step = "deliver";
           this.save();
         } else if (s.step === "repair") {
           this.save("repairing");
@@ -699,43 +787,40 @@ export class Factory {
           s.step = "verify";
           s.documented = false;
           this.save();
-        } else if (s.step === "docs") {
-          this.save("documenting");
-          // oxlint-disable-next-line no-await-in-loop -- Audit the current revision before any documentation changes.
-          const result = (await this.agent(
-            "docs",
-            `READ ONLY audit docs for revision ${s.revision} against approved request and implementation. Return summary and changes boolean; describe exact needed updates in summary. No edits or shell.`,
-          )) as { summary: string; changes: boolean };
-          this.git.unchanged(s, this.currentRevision(s));
-          if (
-            !result ||
-            typeof result.changes !== "boolean" ||
-            typeof result.summary !== "string"
-          ) {
-            throw new Error("Invalid documentation audit");
-          }
-          this.evidence("docs", result);
-          if (result.changes) {
-            // oxlint-disable-next-line no-await-in-loop -- Checkpoint documentation changes before final verification.
-            await this.mutation(
-              "worker",
-              "Update documentation per independent audit: " + result.summary,
-            );
-          }
-          s.documented = true;
-          s.step = "verify";
-          this.save();
         } else if (s.step === "deliver") {
           this.save("delivering");
           this.finalGate();
           if (this.cancelWanted || this.pauseWanted) {
             continue;
           }
-          const revision = this.currentRevision(s);
+          s.active = { role: "finalize", requestId: randomUUID(), started: Date.now() };
+          this.save();
+          const snapshot = s.candidateSnapshot;
+          if (!snapshot) {
+            throw new Error("Missing accepted candidate snapshot");
+          }
+          const triage = s.evidence.find((e) => e.round === s.round && e.role === "triage")?.result;
+          const subject = isRecord(triage) ? triage.commitSubject : undefined;
+          if (!validCommitSubject(subject)) {
+            throw new Error("Invalid final commit subject; gate remains closed");
+          }
+          const finalRevision = this.git.finalize(s, snapshot, subject);
+          s.active = undefined;
+          if (!finalRevision) {
+            s.noChanges = true;
+            this.save("completed");
+            writeFileSync(join(this.store.dir, "report.md"), this.report(), { mode: 0o600 });
+            return;
+          }
+          s.revision = finalRevision;
+          for (const evidence of s.evidence.filter((e) => e.round === s.round)) {
+            evidence.revision = finalRevision;
+          }
+          const revision = finalRevision;
           s.deliveryIntent = revision;
           this.save();
-          if (!approvalMatches(s)) {
-            throw new Error("Approval invalidated");
+          if (s.delivery !== delivery || JSON.stringify(s.target) !== target) {
+            throw new Error("Delivery selection changed during execution");
           }
           if (s.delivery === "local") {
             this.boundary();
@@ -748,8 +833,8 @@ export class Factory {
             // oxlint-disable-next-line no-await-in-loop -- Delivery runs only after its final gate and durable intent are recorded.
             s.pr = await this.delivery.deliver(s, this.report(), () => {
               this.boundary();
-              if (!approvalMatches(s)) {
-                throw new Error("Approval invalidated");
+              if (s.delivery !== delivery || JSON.stringify(s.target) !== target) {
+                throw new Error("Delivery selection changed during execution");
               }
               this.git.unchanged(s, revision);
             });
@@ -757,8 +842,14 @@ export class Factory {
               throw new Error("Invalid draft PR receipt");
             }
           }
+          this.save();
           s.deliveryIntent = undefined;
-          this.save("completed");
+          try {
+            this.save("completed");
+          } catch (e) {
+            s.deliveryIntent = revision;
+            throw e;
+          }
           writeFileSync(join(this.store.dir, "report.md"), this.report(), { mode: 0o600 });
           return;
         } else {
@@ -766,7 +857,7 @@ export class Factory {
         }
       }
     } catch (e) {
-      s.error = String(e);
+      s.error = `Stage ${s.phase}: ${String(e)}`;
       if (this.cancelWanted) {
         s.cancelled = true;
         s.paused = true;
@@ -775,20 +866,32 @@ export class Factory {
         this.pauseWanted = false;
       }
       this.save("blocked");
+      writeFileSync(join(this.store.dir, "report.md"), this.report(), { mode: 0o600 });
     } finally {
       this.running = false;
     }
   }
 
-  private finalGate() {
+  private finalGate(finalized = false) {
     const s = this.state;
     this.git.unchanged(s, this.currentRevision(s));
+    const changed = this.git.changed(s);
+    if (
+      !s.reviewPaths ||
+      s.reviewPaths.length !== changed.length ||
+      changed.some((path) => !s.reviewPaths?.includes(path))
+    ) {
+      throw new Error("Review coverage does not match changed paths");
+    }
+    if (!s.candidateSnapshot || (!finalized && this.git.snapshot(s) !== s.candidateSnapshot)) {
+      throw new Error("Candidate changed since verification");
+    }
     validateFinalFindings(s);
-    if (!s.documented || !approvalMatches(s) || s.findings.some((f) => f.blocking && f.confirmed)) {
+    if (!s.documented || s.findings.some((f) => f.blocking && f.confirmed)) {
       throw new Error("Final quality gate failed");
     }
     const current = s.evidence.filter((e) => e.revision === s.revision && e.round === s.round);
-    for (const role of ["tester", "quality", "security", "ponytail"]) {
+    for (const role of ["tester", "quality", "security", "ponytail", "docs", "triage"]) {
       if (!current.some((e) => e.role === role)) {
         throw new Error("Missing final evidence: " + role);
       }
@@ -820,14 +923,28 @@ export class Factory {
 
   report() {
     const s = this.state;
-    return `# Pi Software Factory ${s.id}\n\nRequest: ${s.request}\n\nDelivery: ${s.delivery ?? "github"}${s.delivery === "local" ? " (local commits only; no push or PR)" : ""}\nPhase: ${s.phase}${s.paused ? " (paused)" : ""}${s.cancelled ? " (cancelled)" : ""}\nStep: ${s.step}; task ${s.task}/${s.plans.at(-1)?.tasks.length ?? 0}; repairs ${s.repairs}/2\nPlan revision: ${s.planRevision}; approved: ${s.approvedRevision ?? "no"}\nBranch: ${s.branch}\n${s.location === "checkout" ? "Checkout" : "Worktree"}: ${s.worktree ?? "not created"}\nRevision: ${s.revision ?? s.baseRevision}\n${s.delivery === "local" ? `Local receipt: ${s.localReceipt?.revision ?? "not delivered"}` : `PR: ${s.pr?.url ?? "not delivered"}`} \nAgent: ${s.active?.role ?? "none"}\nArtifacts: ${this.store.dir}\n${s.error ?? ""}\n\n## Findings\n${JSON.stringify(s.findings, null, 2)}\n\n## Verification\n${JSON.stringify(s.evidence, null, 2)}\n`;
+    const plan = s.plans.at(-1);
+    const findings =
+      s.findings
+        .map(
+          (f) =>
+            `- ${f.confirmed === false ? "Rejected" : f.blocking ? "Blocking" : "Minor"}: ${f.evidence}`,
+        )
+        .join("\n") || (s.error ? "- No accepted findings recorded" : "- None");
+    const checks =
+      [...new Set(s.evidence.filter((e) => e.round === s.round).map((e) => e.role))].join(", ") ||
+      "None completed";
+    const missingReviews = ["quality", "security", "ponytail"].filter(
+      (role) => !s.evidence.some((e) => e.round === s.round && e.role === role),
+    );
+    return `# Factory outcome: ${s.phase === "blocked" && s.deliveryIntent ? "delivery failed" : s.phase}${s.noChanges ? " (already satisfied)" : ""}${s.cancelled ? " (cancelled)" : s.paused ? " (paused)" : ""}\n\n## Request\n${s.request}\n\n## Plan/task summary\n${plan?.summary ?? "Not yet planned"}\n\n## Assumptions and risks\n${plan?.risks.map((r) => `- ${r}`).join("\n") || "- None recorded"}\n\n## Checks\n${checks}. Repair rounds: ${s.repairs}/5.\nReviewer evidence absent: ${missingReviews.join(", ") || "none"}.\n\n## Issues\n${s.error ? `- ${s.error}\n` : ""}${findings}\n\n## Delivery\nBranch: ${s.branch}\nRevision (${s.deliveryIntent ? "final" : s.localReceipt || s.pr ? "delivered" : "current/base; not necessarily a final commit"}): ${s.revision ?? s.baseRevision}\nPR: ${s.pr?.url ?? "none"}\nWorktree: ${s.worktree ?? "not created"}\nOriginal checkout changes were excluded. Local artifacts: ${this.store.dir}\n`;
   }
 }
 
-function validateFindings(value: unknown): asserts value is Finding[] {
+function validateFindings(value: unknown, max = MAX_REVIEW_FINDINGS): asserts value is Finding[] {
   if (
     !Array.isArray(value) ||
-    value.length > 64 ||
+    value.length > max ||
     value.some(
       (f) =>
         !f ||

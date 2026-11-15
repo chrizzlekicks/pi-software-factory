@@ -10,7 +10,7 @@ export function bergerDisplay() {
         ? "agent_settled:error"
         : s.phase === "completed"
           ? "agent_settled"
-          : s.phase === "awaiting_approval" || s.paused
+          : s.paused
             ? "ui_prompt_start"
             : "agent_start";
     if (event === previous) {

@@ -14,6 +14,10 @@ import { Factory } from "./controller.ts";
 import { GitHubDelivery } from "./delivery.ts";
 import { Git } from "./git.ts";
 import { Store } from "./state.ts";
+import type { Run } from "./state.ts";
+
+export const status = (s: Run) =>
+  `${s.phase}${s.phase === "blocked" && s.deliveryIntent ? " (delivery failed)" : ""}${s.cancelled ? " (cancelled)" : s.paused ? " (paused)" : ""} · Repair ${s.repairs}/5`;
 
 export default function factoryExtension(pi: ExtensionAPI) {
   let factory: Factory | undefined;
@@ -53,8 +57,14 @@ export default function factoryExtension(pi: ExtensionAPI) {
       const display = bergerDisplay();
       factory = new Factory(store, git, agents, new GitHubDelivery(git, store.dir), (s) => {
         pi.events.emit("pi-factory:phase", { runId: s.id, phase: s.phase });
+        if (ctx.hasUI) {
+          ctx.ui.setStatus("pi-factory", status(s));
+        }
         display(s);
       });
+      if (ctx.hasUI) {
+        ctx.ui.setStatus("pi-factory", store.state ? status(store.state) : undefined);
+      }
       return factory;
     })();
     try {
