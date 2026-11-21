@@ -46,7 +46,7 @@ export function registerFactoryCommands<C extends CommandContext>(
 
   pi.registerCommand("factory", {
     description:
-      "Autonomous software factory: request, status, inspect, pause, resume, deliver, cancel, report",
+      "Autonomous software factory: <description>, status, pause, resume, deliver, cancel",
     handler: (args, ctx) => {
       if (shuttingDown) {
         ctx.ui.notify("Factory is shutting down", "warning");
@@ -54,16 +54,8 @@ export function registerFactoryCommands<C extends CommandContext>(
       }
       const command = (async () => {
         try {
-          const [first = "status", ...rest] = args.trim().split(/\s+/);
-          let action = first;
-          if (action === "--delivery") {
-            rest.unshift(action);
-            action = "request";
-          }
-          if (action !== "request" && rest.includes("--delivery")) {
-            throw new Error("Place --delivery before the request");
-          }
-          const immediate = ["pause", "cancel", "status", "report", "inspect"].includes(action);
+          const action = args.trim() || "status";
+          const immediate = ["pause", "cancel", "status"].includes(action);
           if ((commandBusy || pending) && !immediate) {
             throw new Error("Factory command already in progress");
           }
@@ -76,18 +68,6 @@ export function registerFactoryCommands<C extends CommandContext>(
               throw new Error("Factory is shutting down");
             }
             switch (action) {
-              case "request": {
-                const mode = rest[0] === "--delivery" ? rest.splice(0, 2)[1] : undefined;
-                if (rest.includes("--delivery")) {
-                  throw new Error("Place --delivery once before the request");
-                }
-                if (mode !== undefined && mode !== "local" && mode !== "github") {
-                  throw new Error("Use --delivery local or github");
-                }
-                start(f, ctx, f.request(rest.join(" "), mode));
-                ctx.ui.notify("Factory run started.", "info");
-                break;
-              }
               case "pause":
                 f.pause();
                 ctx.ui.notify("Pause requested at the next safe boundary.", "info");
@@ -97,9 +77,6 @@ export function registerFactoryCommands<C extends CommandContext>(
                 start(f, ctx, f.drive());
                 break;
               case "deliver":
-                if (rest.length) {
-                  throw new Error("Use /factory deliver without arguments");
-                }
                 start(f, ctx, f.deliver());
                 break;
               case "cancel":
@@ -109,11 +86,7 @@ export function registerFactoryCommands<C extends CommandContext>(
                   "warning",
                 );
                 break;
-              case "inspect":
-                ctx.ui.notify(JSON.stringify(f.state, null, 2), "info");
-                break;
               case "status":
-              case "report":
                 ctx.ui.notify(f.report(), "info");
                 break;
               default:

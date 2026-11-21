@@ -37,7 +37,7 @@ export class GitHubDelivery {
   }
 
   async preflight(): Promise<NonNullable<Run["target"]>> {
-    const base = this.git.git(["symbolic-ref", "--short", "HEAD"]);
+    const startingBranch = this.git.git(["symbolic-ref", "--short", "HEAD"]);
     const startingHead = this.git.head();
     await this.gh(["auth", "status", "--hostname", "github.com"]);
     const remote = this.git.git(["remote", "get-url", "origin"]);
@@ -62,20 +62,21 @@ export class GitHubDelivery {
     ) {
       throw new Error("Repository is not writable or has no default branch");
     }
+    const base = info.defaultBranchRef.name;
     const remoteHead = JSON.parse(
       await this.gh(["api", `repos/${repo}/branches/${encodeURIComponent(base)}`]),
     ).commit?.sha;
-    if (remoteHead !== startingHead) {
-      throw new Error("Starting branch must exist on GitHub at the exact local HEAD revision");
+    if (typeof remoteHead !== "string" || !/^[0-9a-f]{40}$/i.test(remoteHead)) {
+      throw new Error("GitHub default branch has no valid revision");
     }
     await this.rules(repo, "factory/preflight");
     if (
       this.git.head() !== startingHead ||
-      this.git.git(["symbolic-ref", "--short", "HEAD"]) !== base
+      this.git.git(["symbolic-ref", "--short", "HEAD"]) !== startingBranch
     ) {
       throw new Error("Starting branch or HEAD changed during GitHub preflight");
     }
-    return { repo, base, remote };
+    return { repo, base, remote, baseRevision: remoteHead };
   }
 
   async deliver(s: Run, _report: string, boundary: () => void): Promise<NonNullable<Run["pr"]>> {
@@ -139,7 +140,7 @@ export class GitHubDelivery {
       const base = JSON.parse(
         await this.gh(["api", `repos/${target.repo}/branches/${encodeURIComponent(target.base)}`]),
       );
-      if (base.commit?.sha !== s.baseRevision) {
+      if (base.commit?.sha !== (target.baseRevision ?? s.baseRevision)) {
         throw new Error("Remote base moved since preflight");
       }
     }

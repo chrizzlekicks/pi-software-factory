@@ -564,7 +564,7 @@ test("planning uses an isolated worktree and leaves a dirty original checkout un
   git(f.repo, "add", "app.txt");
   writeFileSync(join(f.repo, "app.txt"), "unstaged");
   writeFileSync(join(f.repo, "untracked.txt"), "untracked");
-  const status = git(f.repo, "status", "--porcelain");
+  const originalStatus = git(f.repo, "status", "--porcelain");
   let plannerCwd = "";
   const run = f.factory.agents.run;
   f.factory.agents.run = async (...args) => {
@@ -578,7 +578,7 @@ test("planning uses an isolated worktree and leaves a dirty original checkout un
   assert.notEqual(s.worktree, f.repo);
   assert.equal(plannerCwd, s.worktree);
   assert.equal(readFileSync(join(present(s.worktree), "app.txt"), "utf8"), "old");
-  assert.equal(git(f.repo, "status", "--porcelain"), status);
+  assert.equal(git(f.repo, "status", "--porcelain"), originalStatus);
   assert.equal(git(f.repo, "branch", "--show-current"), "main");
 });
 
@@ -624,12 +624,12 @@ test("GitHub delivery rejects a target that does not match origin before network
   );
 });
 
-test("GitHub preflight targets the starting branch only at its exact remote revision", async (t) => {
+test("GitHub preflight records the default base independently of the local starting branch", async (t) => {
   const f = fixture(t);
   git(f.repo, "switch", "-c", "feature/base");
   git(f.repo, "remote", "add", "origin", "https://github.com/example/repo.git");
   const delivery = new PreflightDelivery(new Git(f.repo), f.store.dir);
-  let remoteHead = git(f.repo, "rev-parse", "HEAD");
+  const remoteHead = "0".repeat(40);
   const calls: string[][] = [];
   Object.defineProperty(delivery, "gh", {
     value: async (args: string[]) => {
@@ -642,16 +642,71 @@ test("GitHub preflight targets the starting branch only at its exact remote revi
           viewerPermission: "WRITE",
         });
       }
-      if (args[1] === "repos/example/repo/branches/feature%2Fbase") {
+      if (args[1] === "repos/example/repo/branches/main") {
         return JSON.stringify({ commit: { sha: remoteHead } });
       }
       return args[0] === "api" ? "[]" : "";
     },
   });
-  assert.equal((await delivery.preflight()).base, "feature/base");
-  assert.ok(calls.some((args) => args[1]?.endsWith("/branches/feature%2Fbase")));
-  remoteHead = "0".repeat(40);
-  await assert.rejects(delivery.preflight(), /exact local HEAD/);
+  const target = await delivery.preflight();
+  assert.equal(target.base, "main");
+  assert.equal(target.baseRevision, remoteHead);
+  assert.ok(calls.some((args) => args[1]?.endsWith("/branches/main")));
+  assert.ok(!calls.some((args) => args[1]?.includes("feature%2Fbase")));
+});
+
+test("GitHub reconciliation checks the recorded remote base, including legacy state", async (t) => {
+  const f = fixture(t);
+  git(f.repo, "remote", "add", "origin", "https://github.com/example/repo.git");
+  await f.factory.request("change app", "local");
+  const s = f.factory.state;
+  const delivery = new PreflightDelivery(new Git(f.repo), f.store.dir);
+  const remoteBase = "1".repeat(40);
+  s.target = {
+    repo: "example/repo",
+    base: "main",
+    remote: "https://github.com/example/repo.git",
+    baseRevision: remoteBase,
+  };
+  let actual = "2".repeat(40);
+  Object.defineProperty(delivery, "gh", {
+    value: async (args: string[]) => {
+      if (args[0] === "repo") {
+        return JSON.stringify({
+          nameWithOwner: "example/repo",
+          defaultBranchRef: { name: "main" },
+          isArchived: false,
+          viewerPermission: "WRITE",
+        });
+      }
+      if (args[1]?.includes("/branches/main")) {
+        return JSON.stringify({ commit: { sha: actual } });
+      }
+      if (args[1]?.includes("/rules/")) {
+        throw new Error("base accepted");
+      }
+      return "";
+    },
+  });
+  await assert.rejects(
+    delivery.reconcile(s, () => {}, false),
+    /Remote base moved/,
+  );
+  actual = remoteBase;
+  await assert.rejects(
+    delivery.reconcile(s, () => {}, false),
+    /base accepted/,
+  );
+  delete s.target.baseRevision;
+  await assert.rejects(
+    delivery.reconcile(s, () => {}, false),
+    /Remote base moved/,
+  );
+  actual = s.baseRevision;
+  await assert.rejects(
+    delivery.reconcile(s, () => {}, false),
+    /base accepted/,
+  );
 });
 
 test("autonomous GitHub lifecycle binds final evidence to the final revision", async (t) => {
@@ -1198,11 +1253,11 @@ test("concurrent commands share initialization and deny a duplicate request", as
     },
     () => f.store.close(),
   );
-  const first = handler("request first", ctx);
-  await handler("request second", ctx);
-  const status = handler("status", ctx);
+  const first = handler("first", ctx);
+  await handler("second", ctx);
+  const statusRequest = handler("status", ctx);
   release();
-  await Promise.all([first, status]);
+  await Promise.all([first, statusRequest]);
   assert.equal(calls, 1);
   assert.ok(notices.some((n) => /already in progress/.test(n)));
   assert.equal(present(f.store.state).request, "first");
@@ -1514,14 +1569,21 @@ test("default delivery completes locally without GitHub preflight or delivery", 
   assert.equal(f.factory.state.pr, undefined);
 });
 
-test("command requests automatically select delivery and accept explicit modes", async (t) => {
+test("command descriptions automatically select delivery", async (t) => {
   const { registerFactoryCommands } = await import("../src/commands.ts");
   // oxlint-disable no-await-in-loop -- Independent command requests are serialized.
   for (const [input, origin, mode] of [
     ["Build app", false, "local"],
-    ["request Build app", true, "github"],
-    ["--delivery github Build app", false, "github"],
-    ["request --delivery local Build app", true, "local"],
+    ["Build app", true, "github"],
+    ["request Build app", false, "local"],
+    ["--delivery github Build app", false, "local"],
+    ["status improve app", false, "local"],
+    ["pause improve app", false, "local"],
+    ["resume improve app", false, "local"],
+    ["cancel improve app", false, "local"],
+    ["deliver improve app", false, "local"],
+    ["report", false, "local"],
+    ["inspect", false, "local"],
   ] as const) {
     const f = fixture(t);
     if (origin) {
@@ -1542,7 +1604,7 @@ test("command requests automatically select delivery and accept explicit modes",
     await waitFor(
       () => f.factory.state.phase === "completed" || f.factory.state.phase === "blocked",
     );
-    assert.equal(f.factory.state.request, "Build app");
+    assert.equal(f.factory.state.request, input);
     assert.equal(f.factory.state.delivery, mode);
     assert.equal(f.factory.state.phase, "completed", f.factory.state.error);
   }
@@ -1558,53 +1620,12 @@ test("local final test failure exhausts two repairs without delivery", async (t)
   assert.equal(present(f.store.state).localReceipt, undefined);
 });
 
-test("request delivery selector preserves request words and rejects missing mode or request", async (t) => {
-  const { registerFactoryCommands } = await import("../src/commands.ts");
+test("unsupported origin fails without local fallback", async (t) => {
   const f = fixture(t);
-  let handler!: CommandHandler;
-  const notices: string[] = [];
-  const pi = {
-    registerCommand(_name: string, command: Command) {
-      handler = command.handler;
-    },
-
-    on() {},
-  };
-  const ctx = {
-    ui: {
-      notify(message: string) {
-        notices.push(message);
-      },
-    },
-  };
-  registerFactoryCommands(
-    pi,
-    async () => f.factory,
-    () => {},
-  );
-  await handler("request --delivery", ctx);
+  git(f.repo, "remote", "add", "origin", "https://gitlab.com/example/repo.git");
+  await assert.rejects(f.factory.request("change"), /unsupported origin/i);
   assert.equal(f.store.state, undefined);
-  await handler("request --delivery local", ctx);
-  assert.equal(f.store.state, undefined);
-  // oxlint-disable no-await-in-loop -- Check each invalid form leaves the shared handler state-free before the next.
-  for (const input of [
-    "--delivery",
-    "--delivery local",
-    "--delivery bogus change",
-    "request change --delivery local",
-    "request --delivery local change --delivery github",
-    "change --delivery local",
-  ]) {
-    await handler(input, ctx);
-    assert.equal(f.store.state, undefined, input);
-  }
-  // oxlint-enable no-await-in-loop
-  await handler("--delivery local keep --option value", ctx);
-  const state = f.factory.state;
-  assert.equal(state.request, "keep --option value");
-  assert.equal(state.delivery, "local");
-  await waitFor(() => state.phase === "completed" || state.phase === "blocked");
-  assert.equal(state.phase, "completed", state.error);
+  assert.deepEqual(f.calls, []);
 });
 
 test("local confirmed review blocker exhausts repairs", async (t) => {
@@ -2081,7 +2102,7 @@ test("triage receives bounded prompts and paged complete command output artifact
   assert.equal(checked, true);
 });
 
-test("non-GitHub origin paths do not trigger GitHub delivery", async (t) => {
+test("non-GitHub origin paths are rejected without delivery", async (t) => {
   // oxlint-disable no-await-in-loop -- Each origin is tested in an independent repository.
   for (const origin of [
     "/srv/mirrors/github.com/owner/repo.git",
@@ -2092,8 +2113,9 @@ test("non-GitHub origin paths do not trigger GitHub delivery", async (t) => {
     f.factory.delivery.preflight = async () => {
       throw new Error("unexpected GitHub preflight");
     };
-    await f.factory.plan("change");
-    assert.equal(f.factory.state.delivery, "local");
+    await assert.rejects(f.factory.plan("change"), /unsupported origin/i);
+    assert.equal(f.store.state, undefined);
+    assert.deepEqual(f.calls, []);
   }
   // oxlint-enable no-await-in-loop
 });
@@ -2204,6 +2226,72 @@ test("delivery-only rejects dirty workspace, missing evidence, and uncertain chi
   assert.equal(s.phase, "blocked");
   rmSync(worktree, { recursive: true, force: true });
   await assert.rejects(f.factory.deliver());
+});
+
+test("GitHub delivery publishes an unpublished local branch onto the default base", async (t) => {
+  const { chmodSync } = await import("node:fs");
+  const f = fixture(t);
+  const bare = join(f.root, "remote.git");
+  git(f.root, "init", "--bare", bare);
+  git(f.repo, "push", bare, "main");
+  const remoteBase = git(f.repo, "rev-parse", "HEAD");
+  git(f.repo, "switch", "-c", "unpublished");
+  writeFileSync(join(f.repo, "local.txt"), "local commit\n");
+  git(f.repo, "add", "local.txt");
+  git(f.repo, "commit", "-m", "local change");
+  const localHead = git(f.repo, "rev-parse", "HEAD");
+  git(f.repo, "remote", "add", "origin", "https://github.com/example/repo.git");
+  git(f.repo, "config", `url.${bare}.pushInsteadOf`, "https://github.com/example/repo.git");
+  const bin = join(f.root, "bin");
+  makeDirectory(bin);
+  const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+  const prFile = join(f.root, "pr.json");
+  writeFileSync(
+    join(bin, "git"),
+    `#!${process.execPath}
+const cp=require('node:child_process'),a=process.argv.slice(2); if(a[0]==='ls-remote') a[2]=${JSON.stringify(bare)}; const r=cp.spawnSync(${JSON.stringify(realGit)},a,{stdio:'inherit'}); process.exit(r.status??1);
+`,
+  );
+  writeFileSync(
+    join(bin, "gh"),
+    `#!${process.execPath}
+const fs=require('node:fs'),cp=require('node:child_process'),a=process.argv.slice(2),file=${JSON.stringify(prFile)};
+if(a[0]==='auth') console.log('ok');
+else if(a[0]==='repo') console.log(JSON.stringify({nameWithOwner:'example/repo',defaultBranchRef:{name:'main'},isArchived:false,viewerPermission:'WRITE'}));
+else if(a[0]==='api'&&a[1].includes('/rules/')) console.log('[]');
+else if(a[0]==='api'&&a[1].endsWith('/branches/main')) console.log(JSON.stringify({commit:{sha:${JSON.stringify(remoteBase)}}}));
+else if(a[0]==='pr'&&a[1]==='list') console.log('[]');
+else if(a[0]==='pr'&&a[1]==='create') { const base=a[a.indexOf('--base')+1],branch=a[a.indexOf('--head')+1],sha=cp.execFileSync(${JSON.stringify(realGit)},['--git-dir',${JSON.stringify(bare)},'rev-parse','refs/heads/'+branch],{encoding:'utf8'}).trim(); fs.writeFileSync(file,JSON.stringify({url:'https://github.com/example/repo/pull/1',isDraft:a.includes('--draft'),headRefName:branch,headRefOid:sha,baseRefName:base})); console.log('https://github.com/example/repo/pull/1'); }
+else if(a[0]==='pr'&&a[1]==='view') console.log(fs.readFileSync(file,'utf8')); else process.exit(1);
+`,
+  );
+  chmodSync(join(bin, "git"), 0o755);
+  chmodSync(join(bin, "gh"), 0o755);
+  const oldPath = process.env.PATH;
+  t.after(() => {
+    if (oldPath === undefined) {
+      delete process.env.PATH;
+    } else {
+      process.env.PATH = oldPath;
+    }
+  });
+  process.env.PATH = bin + ":" + oldPath;
+  f.factory.delivery = new PreflightDelivery(f.factory.git, f.store.dir);
+  await f.factory.request("change app", "github");
+  const s = f.factory.state;
+  assert.equal(s.phase, "completed", s.error);
+  assert.equal(s.baseRevision, localHead);
+  assert.equal(s.target?.base, "main");
+  assert.equal(s.target?.baseRevision, remoteBase);
+  assert.equal(git(f.repo, "rev-parse", "HEAD"), localHead);
+  assert.equal(git(present(s.worktree), "rev-list", "--count", `${localHead}..HEAD`), "1");
+  assert.equal(git(f.root, "--git-dir", bare, "rev-parse", `refs/heads/${s.branch}`), s.revision);
+  assert.equal(
+    git(f.root, "--git-dir", bare, "rev-list", "--count", `${remoteBase}..${s.branch}`),
+    "2",
+  );
+  assert.equal(s.pr?.url, "https://github.com/example/repo/pull/1");
+  assert.equal(JSON.parse(readFileSync(prFile, "utf8")).baseRefName, "main");
 });
 
 test("delivery-only reconciles local remote and interrupted PR creation without duplicate", async (t) => {
@@ -2337,7 +2425,7 @@ else if(a[0]==='pr'&&a[1]==='view') console.log(fs.readFileSync(file,'utf8')); e
   }
 });
 
-test("factory deliver command invokes only delivery retry and rejects arguments", async (t) => {
+test("factory deliver command invokes only delivery retry", async (t) => {
   const { registerFactoryCommands } = await import("../src/commands.ts");
   const f = fixture(t);
   await f.factory.request("change", "local");
@@ -2361,8 +2449,6 @@ test("factory deliver command invokes only delivery retry and rejects arguments"
       },
     },
   };
-  await handler("deliver extra", ctx);
-  assert.match(notices.join("\n"), /without arguments/);
   await handler("deliver", ctx);
   await waitFor(() => notices.some((message) => message.includes("outcome: completed")));
   assert.deepEqual(f.calls, calls);

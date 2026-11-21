@@ -4,7 +4,14 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
+import * as agentCore from "@earendil-works/pi-agent-core";
+import * as ai from "@earendil-works/pi-ai";
+import * as codingAgent from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import * as tui from "@earendil-works/pi-tui";
+import * as typebox from "typebox";
+import * as typeboxCompile from "typebox/compile";
+import * as typeboxValue from "typebox/value";
 import { Value } from "typebox/value";
 
 import { loadSubagents, PiAgents, roles } from "../src/agents.ts";
@@ -369,7 +376,15 @@ test("installed pi-subagents resolves architect, scout and researcher contracts 
         },
       }),
     );
-    const api = await loadSubagents({});
+    const api = await loadSubagents({
+      "@earendil-works/pi-agent-core": agentCore,
+      "@earendil-works/pi-ai": ai,
+      "@earendil-works/pi-coding-agent": codingAgent,
+      "@earendil-works/pi-tui": tui,
+      typebox,
+      "typebox/compile": typeboxCompile,
+      "typebox/value": typeboxValue,
+    });
     const ceiling = {
       allowedAgents: ["architect", "scout", "researcher"],
       allowedTools: [

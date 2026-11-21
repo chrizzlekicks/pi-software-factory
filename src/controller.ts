@@ -107,12 +107,15 @@ export class Factory {
     if (delivery === undefined) {
       const hasOrigin = this.git.git(["remote"]).split("\n").includes("origin");
       const origin = hasOrigin ? this.git.git(["remote", "get-url", "origin"]) : "";
-      delivery =
-        /^(?:[a-z][a-z0-9+.-]*:\/\/(?:[^/@]+@)?github\.com(?=[:/]|$)|(?:[^/@:]+@)?github\.com:)/i.test(
+      if (
+        hasOrigin &&
+        !/^(?:[a-z][a-z0-9+.-]*:\/\/(?:[^/@]+@)?github\.com(?=[:/]|$)|(?:[^/@:]+@)?github\.com:)/i.test(
           origin,
         )
-          ? "github"
-          : "local";
+      ) {
+        throw new Error("Unsupported origin: delivery requires a github.com origin or no origin");
+      }
+      delivery = hasOrigin ? "github" : "local";
     }
     const baseRevision = this.git.head();
     const startingBranch =
@@ -134,7 +137,11 @@ export class Factory {
       if (delivery === "github" && !target) {
         throw new Error("GitHub preflight did not provide a delivery target");
       }
-      if (target && target.base !== startingBranch) {
+      if (
+        target &&
+        (this.git.head() !== baseRevision ||
+          this.git.git(["symbolic-ref", "--short", "HEAD"]) !== startingBranch)
+      ) {
         throw new Error("Starting branch changed before GitHub preflight");
       }
       this.boundary();

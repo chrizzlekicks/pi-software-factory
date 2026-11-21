@@ -76,7 +76,7 @@ export type Run = {
   branch: string;
   worktree?: string;
   delivery?: "github" | "local";
-  target?: { repo: string; base: string; remote: string } | undefined;
+  target?: { repo: string; base: string; remote: string; baseRevision?: string } | undefined;
   step: string;
   task: number;
   repairs: number;
@@ -245,7 +245,8 @@ function validateRunFields(s: unknown): asserts s is Run {
       : !isRecord(s.target) ||
         !text(s.target.repo) ||
         !text(s.target.base) ||
-        !text(s.target.remote)) ||
+        !text(s.target.remote) ||
+        (s.target.baseRevision !== undefined && !text(s.target.baseRevision))) ||
     !integer(s.planRevision) ||
     s.planRevision < 1 ||
     !Array.isArray(s.plans) ||
