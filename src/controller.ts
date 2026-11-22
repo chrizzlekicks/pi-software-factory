@@ -183,7 +183,7 @@ export class Factory {
       const plan = validatePlan(
         await this.agent(
           "planner",
-          `Delegate repository inspection to scout and, when useful, web research to researcher, instructing it to call web_enable first. Do not implement changes. Plan this request: ${request}\nReturn dependencies, risks, exact allowed file paths (directory prefixes end in /), ordered tasks and concrete build/test/black-box verification commands as executable + argv. Include documentation paths. Propose at least one task, file path and verification command; make reasonable assumptions and record them in risks. No implementation.`,
+          `Delegate repository inspection to scout and, when useful, web research to researcher, instructing it to call web_enable first. Do not implement changes. Plan this request: ${request}\nReturn dependencies, risks, exact allowed file paths (directory prefixes end in /), ordered tasks and concrete build/test/black-box verification commands as executable + argv. Include documentation paths. Inspect affected callers and legacy/upgrade paths; do not assume a shared helper change covers them. Map each material risk or invariant to concrete implementation tasks and observable verification, including runtime isolation and regression coverage where relevant. Check required special environment availability before implementation; if unavailable, explicitly block or obtain approval for a fallback, and never present fallback evidence as equivalent. Check that tasks and verification actually satisfy the architectural constraints. Propose at least one task, file path and verification command; make reasonable assumptions and record them in risks. No implementation.`,
         ),
       );
       this.boundary();
@@ -463,7 +463,7 @@ export class Factory {
       const revise = async (attempt: number): Promise<void> => {
         const response = await this.agent(
           "planner",
-          `READ ONLY revise scope and verification for request ${s.request}. Existing plan: ${JSON.stringify(previous)}. Changed paths: ${JSON.stringify(this.git.changed(s))}. Requested revision: ${result.scopeChange}. Include every changed path; preserve or strengthen verification. Do not edit.${feedback}`,
+          `READ ONLY revise scope and verification for request ${s.request}. Existing plan: ${JSON.stringify(previous)}. Changed paths: ${JSON.stringify(this.git.changed(s))}. Requested revision: ${result.scopeChange}. Include every changed path; preserve or strengthen verification. Keep material risks and invariants mapped to concrete tasks and observable verification, inspect affected callers and legacy/upgrade paths, and check tasks against architectural constraints. Check required special environment availability before implementation; if unavailable, explicitly block or obtain approval for a fallback, without claiming equivalent evidence. Do not edit.${feedback}`,
         );
         if (this.git.snapshot(s) !== snapshot) {
           throw new Error("Planner changed the candidate during scope revision");

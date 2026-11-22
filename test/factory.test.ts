@@ -2651,3 +2651,52 @@ test("worktree ownership supports symlinked state directory", async (t) => {
   assert.equal(f.factory.state.phase, "completed", f.factory.state.error);
   assert.ok(f.factory.git.snapshot(f.factory.state));
 });
+
+test("cancellation confirmation follows successful settlement and persistence", async () => {
+  const { registerFactoryCommands } = await import("../src/commands.ts");
+  let handler!: CommandHandler;
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const messages: string[] = [];
+  const notices: string[] = [];
+  const state = { cancelled: false, phase: "blocked" };
+  const factory = {
+    state,
+    report: () => "artifacts",
+    cancel: () => {
+      state.cancelled = true;
+    },
+    request: () => gate,
+  } as unknown as Factory;
+  registerFactoryCommands(
+    {
+      registerCommand(_name: string, command: Command) {
+        handler = command.handler;
+      },
+      on() {},
+      sendMessage(message) {
+        messages.push(message.content);
+      },
+    },
+    async () => factory,
+    () => {},
+  );
+  const ctx = {
+    ui: {
+      notify(message: string) {
+        notices.push(message);
+      },
+    },
+  };
+  await handler("work", ctx);
+  await handler("cancel", ctx);
+  assert.ok(notices.some((n) => n.includes("Cancellation requested")));
+  assert.equal(messages.length, 0);
+  release();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.match(messages[0]!, /was cancelled.*Artifacts are retained/s);
+  await handler("cancel", ctx);
+  assert.equal(messages.length, 2);
+});

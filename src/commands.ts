@@ -28,10 +28,21 @@ export function registerFactoryCommands<C extends CommandContext>(
       throw e;
     }));
 
+  function cancelled(f: Factory, ctx: C) {
+    const content = `Factory run was cancelled. Artifacts are retained.\n\n${f.report()}`;
+    if (pi.sendMessage) {
+      pi.sendMessage({ customType: "pi-factory-report", content, display: true });
+    } else {
+      ctx.ui.notify(content, "warning");
+    }
+  }
+
   function start(f: Factory, ctx: C, run: Promise<void>) {
     pending = run
       .then(() => {
-        if (pi.sendMessage) {
+        if (f.state.cancelled) {
+          cancelled(f, ctx);
+        } else if (pi.sendMessage) {
           pi.sendMessage({ customType: "pi-factory-report", content: f.report(), display: true });
         } else {
           ctx.ui.notify(f.report(), f.state.phase === "completed" ? "info" : "warning");
@@ -81,10 +92,11 @@ export function registerFactoryCommands<C extends CommandContext>(
                 break;
               case "cancel":
                 f.cancel();
-                ctx.ui.notify(
-                  "Cancellation requested; inspect the preserved artifacts.",
-                  "warning",
-                );
+                if (pending) {
+                  ctx.ui.notify("Cancellation requested; awaiting completion.", "warning");
+                } else {
+                  cancelled(f, ctx);
+                }
                 break;
               case "status":
                 ctx.ui.notify(f.report(), "info");

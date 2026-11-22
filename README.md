@@ -40,3 +40,7 @@ The local `pi-factory:phase` event reports persisted phases. Optional Berger int
 For offline tests, live-smoke setup, and validation details, see the [Docker test rig](docker/README.md).
 
 When a scope revision removes an existing verification command, the planner receives the missing commands and may retry up to two times. Other validation failures stop the run; exhausted retries block it without accepting the revision.
+
+## Planned planning challenge (issue #1)
+
+Pending implementation: a sage challenger should read and challenge the planner's proposal, returning either sign-off or actionable blocking findings. Allow at most three challenger reviews total: the initial review and up to two planner revision/re-review cycles. If the third review still lacks sign-off, implementation may proceed without claiming sign-off, with unresolved findings explicitly carried forward to the worker and post-implementation reviewers. Existing scope, security and verification gates still apply. The planner alone revises the plan; the challenger never writes or edits files. Enforce this with read-only tool restrictions rather than relying on instructions alone. No challenger or planning challenge loop currently runs.
