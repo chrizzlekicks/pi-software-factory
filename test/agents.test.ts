@@ -17,6 +17,14 @@ import { Value } from "typebox/value";
 import { loadSubagents, PiAgents, roles } from "../src/agents.ts";
 import { validatePlan } from "../src/git.ts";
 
+test("challenger uses the read-only oracle contract", () => {
+  assert.equal(roles.challenger?.agent, "oracle");
+  assert.equal(roles.challenger?.readOnly, true);
+  const schema = roles.challenger?.schema as Parameters<typeof Value.Check>[0];
+  assert.equal(Value.Check(schema, { approved: false, findings: ["Missing verification"] }), true);
+  assert.equal(Value.Check(schema, { findings: [] }), false);
+});
+
 test("planner uses the trusted architect", () => {
   assert.equal(roles.planner?.agent, "architect");
   assert.equal(roles.planner?.readOnly, false);

@@ -59,6 +59,12 @@ export type Evidence = {
   at: number;
 };
 
+export type PlanningProgress = {
+  next: "review" | "revise" | "approved" | "blocked" | "exhausted";
+  reviews: { planRevision: number; approved: boolean; findings: string[] }[];
+  unresolved: string[];
+};
+
 export type Run = {
   version: 1 | 2;
   id: string;
@@ -73,6 +79,7 @@ export type Run = {
   pauseSnapshot?: string | undefined;
   planRevision: number;
   plans: Plan[];
+  planning?: PlanningProgress;
   branch: string;
   worktree?: string;
   delivery?: "github" | "local";
@@ -257,6 +264,54 @@ function validateRunFields(s: unknown): asserts s is Run {
   }
   for (const plan of s.plans) {
     validatePlan(plan);
+  }
+  if (s.planning !== undefined) {
+    const p = s.planning;
+    if (
+      !isRecord(p) ||
+      !["review", "revise", "approved", "blocked", "exhausted"].includes(String(p.next)) ||
+      !Array.isArray(p.reviews) ||
+      p.reviews.length > 3 ||
+      !Array.isArray(p.unresolved) ||
+      p.unresolved.some((f: unknown) => !text(f))
+    ) {
+      fail();
+    }
+    const reviews = p.reviews as unknown[];
+    for (const [index, review] of reviews.entries()) {
+      if (
+        !isRecord(review) ||
+        !integer(review.planRevision) ||
+        review.planRevision !== index + 1 ||
+        review.planRevision > s.plans.length ||
+        typeof review.approved !== "boolean" ||
+        !Array.isArray(review.findings) ||
+        review.findings.length > MAX_REVIEW_FINDINGS ||
+        review.findings.some((f: unknown) => !text(f)) ||
+        (review.approved && review.findings.length !== 0) ||
+        (!review.approved && review.findings.length === 0) ||
+        (index < reviews.length - 1 && review.approved)
+      ) {
+        fail();
+      }
+    }
+    const last = reviews.at(-1) as { approved: boolean; findings: string[] } | undefined;
+    if (
+      (p.next === "approved" && (!last?.approved || last.findings.length !== 0)) ||
+      ((p.next === "blocked" || p.next === "exhausted") &&
+        (reviews.length !== 3 ||
+          !last ||
+          last.approved ||
+          JSON.stringify(p.unresolved) !== JSON.stringify(last.findings))) ||
+      (p.next === "revise" && (!last || last.approved || reviews.length >= 3)) ||
+      (p.next === "review" &&
+        (reviews.length >= 3 || !!last?.approved || s.plans.length !== reviews.length + 1)) ||
+      (p.next !== "blocked" && p.next !== "exhausted" && p.unresolved.length !== 0) ||
+      (p.next === "revise" && s.plans.length !== reviews.length) ||
+      (p.next === "approved" && s.plans.length < reviews.length)
+    ) {
+      fail();
+    }
   }
   if (
     !integer(s.task) ||
@@ -552,6 +607,7 @@ export class Store {
           this.state.deliveryIntent ||
           (!this.state.paused &&
             !this.state.cancelled &&
+            !(this.state.phase === "planning" && this.state.planning) &&
             !["completed", "failed", "blocked"].includes(this.state.phase))
         ) {
           this.state.phase = "blocked";

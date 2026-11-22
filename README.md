@@ -5,7 +5,7 @@ Pi Software Factory is a Pi extension for an autonomous sequential implementatio
 ## Prerequisites
 
 - Node.js 24 or newer and Git with author and committer identity configured.
-- A compatible Pi coding agent and separately installed and loaded pi-subagents extension, with configured and authenticated models. The `architect`, `worker`, `test-runner`, `reviewer`, and `docs-auditor` agents and `ponytail-review` skill must be available.
+- A compatible Pi coding agent and separately installed and loaded pi-subagents extension, with configured and authenticated models. The `architect`, `oracle`, `worker`, `test-runner`, `reviewer`, and `docs-auditor` agents and `ponytail-review` skill must be available.
 - A Git checkout with an existing HEAD. GitHub delivery additionally requires authenticated GitHub CLI (`gh`), a supported github.com origin, a named current branch, and repository write access. Local delivery needs no origin, GitHub CLI, or GitHub authentication; model authentication is still required.
 
 See [compatibility](COMPATIBILITY.md) for tested versions and integration limits. Set `PI_FACTORY_SUBAGENTS_PATH` to the installed pi-subagents package directory if package resolution cannot find it.
@@ -41,6 +41,8 @@ For offline tests, live-smoke setup, and validation details, see the [Docker tes
 
 When a scope revision removes an existing verification command, the planner receives the missing commands and may retry up to two times. Other validation failures stop the run; exhausted retries block it without accepting the revision.
 
-## Planned planning challenge (issue #1)
+## Planning challenge and recovery
 
-Pending implementation: a sage challenger should read and challenge the planner's proposal, returning either sign-off or actionable blocking findings. Allow at most three challenger reviews total: the initial review and up to two planner revision/re-review cycles. If the third review still lacks sign-off, implementation may proceed without claiming sign-off, with unresolved findings explicitly carried forward to the worker and post-implementation reviewers. Existing scope, security and verification gates still apply. The planner alone revises the plan; the challenger never writes or edits files. Enforce this with read-only tool restrictions rather than relying on instructions alone. No challenger or planning challenge loop currently runs.
+A read-only challenger reviews the plan. Explicit signoff with no findings permits implementation. Rejections trigger a guarded planner revision and another review, up to three reviews total; a third valid rejection permits implementation with unresolved findings passed to the worker and reviewers. Revisions cannot expand allowed paths or remove verification commands; semantic scope remains protected by instructions rather than mechanical enforcement.
+
+Planning progress is persisted as optional `planning: { next, reviews, unresolved }`, where `next` is `review`, `revise`, `approved`, `exhausted`, or `blocked`, and each review records `planRevision`, `approved`, and `findings`. Completed boundaries resume without repeating a review. An uncertain active operation fails closed and requires inspection rather than assuming it completed safely. Legacy state without planning metadata is only recoverable when its plan history is unambiguous.

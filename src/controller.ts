@@ -191,7 +191,9 @@ export class Factory {
         throw new Error("Planner changed worktree");
       }
       this.state.plans.push(plan);
-      this.save("implementing");
+      this.save();
+      this.state.planning = { next: "review", reviews: [], unresolved: [] };
+      this.save();
     } catch (e) {
       if (this.store.state && this.store.state !== old) {
         this.state.error = String(e);
@@ -403,7 +405,7 @@ export class Factory {
     }
   }
 
-  private async agent(role: string, task: string) {
+  private async agent(role: string, task: string, retainActive = false) {
     this.boundary();
     const s = this.state;
     const identity = {
@@ -423,7 +425,9 @@ export class Factory {
     }
     this.git.unchanged(s, revision);
     s.executions.push({ role, revision, round: s.round, result, at: Date.now() });
-    s.active = undefined;
+    if (!retainActive) {
+      s.active = undefined;
+    }
     this.abort = undefined;
     this.save();
     return result;
@@ -435,7 +439,7 @@ export class Factory {
     const before = this.git.head(this.checkout(s));
     const result = (await this.agent(
       role,
-      `${task}\nCurrent validated plan revision ${s.planRevision}: ${JSON.stringify(this.planValue)}\nReport necessary scope changes in scopeChange. Install project-defined dependencies if needed. Never commit, push, create PRs, change branches/worktrees, alter Git metadata, or weaken verification. Preserve existing changes. Return summary and scopeChange (empty when none).`,
+      `${task}\nUnresolved planning findings: ${JSON.stringify(s.planning?.unresolved ?? [])}. Current validated plan revision ${s.planRevision}: ${JSON.stringify(this.planValue)}\nReport necessary scope changes in scopeChange. Install project-defined dependencies if needed. Never commit, push, create PRs, change branches/worktrees, alter Git metadata, or weaken verification. Preserve existing changes. Return summary and scopeChange (empty when none).`,
     )) as { summary: string; scopeChange: string };
     if (this.git.head(this.checkout(s)) !== before) {
       throw new Error("Worker changed Git HEAD; inspect before recovery");
@@ -588,7 +592,7 @@ export class Factory {
       }> => {
         const r = (await this.agent(
           role,
-          `Independent adversarial READ-ONLY review of ${s.worktree}, changes from ${s.baseRevision}. Focus on ${focus}. Read the entire review material at ${material}, using read offsets and limits to page large text, and inspect connected code. Fully inspect every changed path: ${JSON.stringify(paths)}. Plan: ${JSON.stringify(this.planValue)}. Return summary, findings with unique id, blocking boolean and concrete evidence/file paths. Coverage must contain only the exact repository-relative changed path strings, each once, with no descriptions, artifact paths or context paths; mention context separately in summary or findings. Never claim coverage of unreadable or uninspected material. No shell or edits. ${correction}`,
+          `Independent adversarial READ-ONLY review of ${s.worktree}, changes from ${s.baseRevision}. Focus on ${focus}. Read the entire review material at ${material}, using read offsets and limits to page large text, and inspect connected code. Fully inspect every changed path: ${JSON.stringify(paths)}. Plan: ${JSON.stringify(this.planValue)}. Unresolved planning findings: ${JSON.stringify(s.planning?.unresolved ?? [])}. Return summary, findings with unique id, blocking boolean and concrete evidence/file paths. Coverage must contain only the exact repository-relative changed path strings, each once, with no descriptions, artifact paths or context paths; mention context separately in summary or findings. Never claim coverage of unreadable or uninspected material. No shell or edits. ${correction}`,
         )) as { summary: string; findings: Finding[]; coverage: string[] };
         this.git.unchanged(s, this.currentRevision(s));
         if (this.git.snapshot(s) !== s.candidateSnapshot) {
@@ -714,6 +718,98 @@ export class Factory {
     return !result.complete || s.findings.some((f) => f.confirmed && f.blocking);
   }
 
+  private async planningStep() {
+    const s = this.state;
+    if (!s.planning) {
+      if (s.plans.length !== 1) {
+        throw new Error("Legacy planning state requires inspection");
+      }
+      s.planning = { next: "review", reviews: [], unresolved: [] };
+      this.save();
+    }
+    const p = s.planning;
+    if (p.next === "approved" || p.next === "exhausted") {
+      this.save("implementing");
+      return;
+    }
+    if (p.next === "blocked") {
+      this.save("blocked");
+      return;
+    }
+    const snapshot = this.git.snapshot(s);
+    if (p.next === "review") {
+      const result = await this.agent(
+        "challenger",
+        `READ ONLY review this plan for request ${s.request}. Return approved boolean and actionable findings as strings: ${JSON.stringify(this.planValue)}`,
+        true,
+      );
+      this.boundary();
+      if (this.git.snapshot(s) !== snapshot) {
+        throw new Error("Challenger changed worktree");
+      }
+      if (
+        !result ||
+        typeof result !== "object" ||
+        !("approved" in result) ||
+        typeof result.approved !== "boolean" ||
+        !("findings" in result) ||
+        !Array.isArray(result.findings) ||
+        result.findings.length > MAX_REVIEW_FINDINGS ||
+        (!result.approved && result.findings.length === 0) ||
+        result.findings.some((f: unknown) => typeof f !== "string" || !f.trim())
+      ) {
+        throw new Error("Invalid planning review");
+      }
+      const findings = result.findings as string[];
+      const approved = result.approved && findings.length === 0;
+      p.reviews.push({ planRevision: s.plans.length, approved, findings });
+      p.next = approved ? "approved" : p.reviews.length === 3 ? "exhausted" : "revise";
+      if (p.next === "exhausted") {
+        p.unresolved = findings;
+      }
+      s.active = undefined;
+      this.save();
+      return;
+    }
+    const previous = this.planValue;
+    const candidate = validatePlan(
+      await this.agent(
+        "planner",
+        `READ ONLY revise the plan for ${s.request}. Existing plan: ${JSON.stringify(previous)}. Findings: ${JSON.stringify(p.reviews.at(-1)?.findings)}. Do not expand original scope or allowed paths, or weaken verification. Do not edit.`,
+        true,
+      ),
+    );
+    this.boundary();
+    if (this.git.snapshot(s) !== snapshot) {
+      throw new Error("Planner changed worktree");
+    }
+    const original = s.plans[0]!;
+    if (
+      candidate.files.some(
+        (path) =>
+          !original.files.some((allowed) =>
+            allowed.endsWith("/") ? path.startsWith(allowed) : path === allowed,
+          ),
+      ) ||
+      previous.verification.some(
+        (old) =>
+          !candidate.verification.some(
+            (next) =>
+              next.command === old.command &&
+              next.purpose === old.purpose &&
+              JSON.stringify(next.args) === JSON.stringify(old.args),
+          ),
+      )
+    ) {
+      throw new Error("Planning revision expanded paths or weakened verification");
+    }
+    s.plans.push(candidate);
+    s.planRevision++;
+    p.next = "review";
+    s.active = undefined;
+    this.save();
+  }
+
   async drive() {
     this.idle();
     const s = this.state;
@@ -746,6 +842,10 @@ export class Factory {
           throw new Error("Delivery selection changed during execution");
         }
         this.git.unchanged(s, this.currentRevision(s));
+        if (s.phase === "planning") {
+          await this.planningStep();
+          return this.state.phase !== "blocked";
+        }
         if (s.step === "implement") {
           this.save("implementing");
           if (s.task < this.planValue.tasks.length) {

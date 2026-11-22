@@ -48,6 +48,11 @@ export const roles: Record<
       verification: { type: "array", items: command, minItems: 1, maxItems: 16 },
     }),
   },
+  challenger: {
+    agent: "oracle",
+    readOnly: true,
+    schema: object({ approved: flag, findings: texts }),
+  },
   worker: {
     agent: "worker",
     readOnly: false,

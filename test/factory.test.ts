@@ -80,6 +80,9 @@ function fixture(t: TestContext, failures = 0) {
       if (role === "planner") {
         return plan;
       }
+      if (role === "challenger") {
+        return { approved: true, findings: [] };
+      }
       if (role === "worker") {
         writeFileSync(join(cwd, "app.txt"), "new");
         return { summary: "Done", scopeChange: "" };
@@ -196,6 +199,7 @@ test("autonomous request runs all gates and creates one final commit", async (t)
   assert.equal(git(present(s.worktree), "rev-list", "--count", `${s.baseRevision}..HEAD`), "1");
   assert.deepEqual(f.calls, [
     "planner",
+    "challenger",
     "worker",
     "tester",
     "quality",
@@ -211,6 +215,60 @@ test("autonomous request runs all gates and creates one final commit", async (t)
   } finally {
     reopened.close();
   }
+});
+
+test("planning rejection revises and rereviews before worker dispatch", async (t) => {
+  const f = fixture(t);
+  const run = f.factory.agents.run;
+  let reviews = 0;
+  f.factory.agents.run = async (...args) => {
+    if (args[0] === "challenger" && reviews++ === 0) {
+      f.calls.push("challenger");
+      return { approved: false, findings: ["Missing verification"] };
+    }
+    return run(...args);
+  };
+  await f.factory.request("change app", "local");
+  assert.equal(f.store.state?.phase, "completed", f.store.state?.error);
+  assert.deepEqual(f.calls.slice(0, 5), [
+    "planner",
+    "challenger",
+    "planner",
+    "challenger",
+    "worker",
+  ]);
+  assert.deepEqual(
+    f.store.state?.planning?.reviews.map((r) => r.approved),
+    [false, true],
+  );
+});
+
+test("planning third rejection proceeds with unresolved findings", async (t) => {
+  const f = fixture(t);
+  const run = f.factory.agents.run;
+  const prompts: string[] = [];
+  f.factory.agents.run = async (...args) => {
+    if (["worker", "quality", "security", "ponytail"].includes(args[0])) {
+      prompts.push(JSON.stringify(args));
+    }
+    if (args[0] === "challenger") {
+      f.calls.push("challenger");
+      return { approved: false, findings: ["Missing verification"] };
+    }
+    return run(...args);
+  };
+  await f.factory.request("change app", "local");
+  assert.equal(f.store.state?.phase, "completed", f.store.state?.error);
+  assert.deepEqual(f.store.state?.planning?.unresolved, ["Missing verification"]);
+  assert.ok(prompts.length > 1 && prompts.every((p) => p.includes("Missing verification")));
+  assert.deepEqual(f.calls.slice(0, 6), [
+    "planner",
+    "challenger",
+    "planner",
+    "challenger",
+    "planner",
+    "challenger",
+  ]);
 });
 
 test("autonomous request exhausts the shared five repairs without committing", async (t) => {
@@ -805,6 +863,7 @@ test("autonomous GitHub lifecycle binds final evidence to the final revision", a
   assert.equal(git(present(s.worktree), "status", "--porcelain"), "");
   assert.deepEqual(f.calls, [
     "planner",
+    "challenger",
     "worker",
     "tester",
     "quality",
@@ -859,6 +918,9 @@ test("scope escape blocks delivery and revokes approval", async (t) => {
     if (role === "planner") {
       return f.plan;
     }
+    if (role === "challenger") {
+      return { approved: true, findings: [] };
+    }
     writeFileSync(join(cwd, "unapproved.txt"), "escape");
     return { summary: "done", scopeChange: "" };
   };
@@ -872,8 +934,8 @@ test("pause and resume preserve a runnable autonomous plan", async (t) => {
   const f = fixture(t);
   await f.factory.plan("change", "github");
   f.factory.pause();
-  assert.match(f.factory.report(), /implementing.*paused/);
-  assert.match(status(f.factory.state), /implementing.*paused/);
+  assert.match(f.factory.report(), /planning.*paused/);
+  assert.match(status(f.factory.state), /planning.*paused/);
   await assert.rejects(f.factory.drive(), /runnable/);
   await f.factory.resume();
   await f.factory.drive();
@@ -1173,6 +1235,8 @@ test("invalid persisted evidence is rejected without rewriting the state", async
 test("restart blocks a nonterminal boundary even without an active child", async (t) => {
   const f = fixture(t);
   await f.factory.plan("change", "github");
+  f.factory.state.phase = "implementing";
+  f.store.save();
   f.store.close();
   const reopened = new Store(f.store.dir);
   try {
@@ -2699,4 +2763,195 @@ test("cancellation confirmation follows successful settlement and persistence", 
   assert.match(messages[0]!, /was cancelled.*Artifacts are retained/s);
   await handler("cancel", ctx);
   assert.equal(messages.length, 2);
+});
+
+test("planning rejects malformed or mutating challenger output", async (t) => {
+  for (const mode of ["malformed", "mutation", "empty rejection"]) {
+    await t.test(mode, async (t) => {
+      const f = fixture(t);
+      const run = f.factory.agents.run;
+      f.factory.agents.run = async (...args) => {
+        if (args[0] !== "challenger") {
+          return run(...args);
+        }
+        f.calls.push("challenger");
+        if (mode === "mutation") {
+          writeFileSync(join(args[2], "app.txt"), "unauthorized");
+        }
+        return mode === "malformed"
+          ? { approved: "yes", findings: [] }
+          : { approved: mode !== "empty rejection", findings: [] };
+      };
+      await f.factory.request("change app", "local");
+      assert.notEqual(f.store.state?.phase, "completed");
+      assert.match(
+        f.store.state?.error ?? "",
+        /Invalid planning review|Challenger changed worktree/,
+      );
+      assert.ok(!f.calls.includes("worker"));
+    });
+  }
+});
+
+test("planning rejects revision path expansion or removal of verification", async (t) => {
+  for (const mode of ["paths", "verification"]) {
+    await t.test(mode, async (t) => {
+      const f = fixture(t);
+      f.plan.verification.push({ command: "true", args: [], purpose: "Second check" });
+      const run = f.factory.agents.run;
+      let planners = 0;
+      f.factory.agents.run = async (...args) => {
+        if (args[0] === "challenger") {
+          f.calls.push("challenger");
+          return { approved: false, findings: ["Revise"] };
+        }
+        if (args[0] === "planner" && ++planners === 2) {
+          f.calls.push("planner");
+          return {
+            ...f.plan,
+            ...(mode === "paths"
+              ? { files: ["other.txt"] }
+              : { verification: f.plan.verification.slice(0, 1) }),
+          };
+        }
+        return run(...args);
+      };
+      await f.factory.request("change app", "local");
+      assert.notEqual(f.store.state?.phase, "completed");
+      assert.ok(!f.calls.includes("worker"));
+      assert.equal(f.store.state?.plans.length, 1);
+    });
+  }
+});
+
+test("persisted planning boundaries resume without replaying completed reviews", async (t) => {
+  for (const boundary of ["review", "revise", "approved", "exhausted", "active"] as const) {
+    await t.test(boundary, async (t) => {
+      const f = fixture(t);
+      await f.factory.plan("change app", "local");
+      const s = f.factory.state;
+      s.phase = "planning";
+      const rejected = { planRevision: 1, approved: false, findings: ["risk"] };
+      if (boundary === "revise") {
+        s.planning = { next: "revise", reviews: [rejected], unresolved: [] };
+      }
+      if (boundary === "approved") {
+        s.planning = {
+          next: "approved",
+          reviews: [{ planRevision: 1, approved: true, findings: [] }],
+          unresolved: [],
+        };
+      }
+      if (boundary === "exhausted") {
+        s.plans.push(structuredClone(s.plans[0]!), structuredClone(s.plans[0]!));
+        s.planRevision = 3;
+        s.planning = {
+          next: "exhausted",
+          reviews: [rejected, { ...rejected, planRevision: 2 }, { ...rejected, planRevision: 3 }],
+          unresolved: ["risk"],
+        };
+      }
+      if (boundary === "active") {
+        s.active = { role: "challenger", requestId: "uncertain", started: Date.now() };
+      }
+      f.store.save();
+      f.store.close();
+      const reopened = new Store(f.store.dir);
+      try {
+        const factory = new Factory(
+          reopened,
+          new Git(f.repo),
+          f.factory.agents,
+          f.factory.delivery,
+        );
+        if (boundary === "active") {
+          await assert.rejects(factory.resume(), /uncertain/i);
+          assert.deepEqual(f.calls, ["planner"]);
+          return;
+        }
+        await factory.resume();
+        await factory.drive();
+        if (boundary === "exhausted") {
+          assert.equal(factory.state.phase, "completed", factory.state.error);
+          assert.ok(f.calls.includes("worker"));
+        } else {
+          assert.equal(factory.state.phase, "completed", factory.state.error);
+          assert.equal(
+            f.calls.filter((role) => role === "challenger").length,
+            boundary === "approved" ? 0 : 1,
+          );
+          assert.equal(factory.state.planning?.reviews.length, boundary === "revise" ? 2 : 1);
+        }
+      } finally {
+        reopened.close();
+      }
+    });
+  }
+});
+
+test("planning completion interruption and pause retain uncertain active operation", async (t) => {
+  for (const role of ["challenger", "planner"] as const) {
+    for (const mode of ["interruption", "pause"] as const) {
+      await t.test(`${role} ${mode}`, async (t) => {
+        const f = fixture(t);
+        const run = f.factory.agents.run;
+        let planners = 0;
+        let captured = "";
+        f.factory.agents.run = async (...args) => {
+          if (args[0] === "challenger" && role === "planner") {
+            f.calls.push("challenger");
+            return { approved: false, findings: ["Revise"] };
+          }
+          const result = await run(...args);
+          if (args[0] === "planner") {
+            planners++;
+          }
+          if (args[0] === role && (role !== "planner" || planners === 2)) {
+            if (mode === "pause") {
+              f.factory.pause();
+            }
+          }
+          return result;
+        };
+        const save = f.store.save.bind(f.store);
+        f.store.save = () => {
+          const s = f.store.state;
+          if (
+            !captured &&
+            s?.active?.role === role &&
+            s.executions.at(-1)?.role === role &&
+            (role !== "planner" || planners === 2)
+          ) {
+            save();
+            captured = readFileSync(join(f.store.dir, "state.json"), "utf8");
+            if (mode === "interruption") {
+              throw new Error("simulated interruption");
+            }
+            return;
+          }
+          save();
+        };
+        await f.factory.request("change app", "local");
+        assert.ok(captured);
+        const copy = join(f.root, "reopened");
+        makeDirectory(copy);
+        writeFileSync(join(copy, "state.json"), captured);
+        const reopened = new Store(copy);
+        try {
+          assert.equal(reopened.state?.active?.role, role);
+          const factory = new Factory(
+            reopened,
+            new Git(f.repo),
+            f.factory.agents,
+            f.factory.delivery,
+          );
+          const calls = f.calls.length;
+          await assert.rejects(factory.resume(), /uncertain/i);
+          assert.equal(f.calls.length, calls);
+        } finally {
+          reopened.close();
+        }
+      });
+    }
+  }
 });
