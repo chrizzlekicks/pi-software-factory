@@ -38,3 +38,5 @@ Do not edit a factory worktree during a run: concurrent human edits cannot be di
 The local `pi-factory:phase` event reports persisted phases. Optional Berger integration is best-effort and display-only; persisted factory state remains authoritative.
 
 For offline tests, live-smoke setup, and validation details, see the [Docker test rig](docker/README.md).
+
+When a scope revision removes an existing verification command, the planner receives the missing commands and may retry up to two times. Other validation failures stop the run; exhausted retries block it without accepting the revision.

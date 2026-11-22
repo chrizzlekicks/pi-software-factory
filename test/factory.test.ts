@@ -263,6 +263,89 @@ test("scope changes are replanned automatically and included in review", async (
   assert.ok(f.factory.state.reviewPaths?.includes("new.txt"));
 });
 
+for (const scenario of [
+  "corrected",
+  "reordered",
+  "exhausted",
+  "invalid",
+  "mutated",
+  "invalid-mutated",
+  "invalid-cancelled",
+  "invalid-mutated-cancelled",
+  "cancelled",
+] as const) {
+  test(`scope revision retry: ${scenario}`, async (t) => {
+    const f = fixture(t);
+    const run = f.factory.agents.run;
+    let revisions = 0;
+    const prompts: string[] = [];
+    f.factory.agents.run = async (...args) => {
+      if (args[0] === "worker") {
+        writeFileSync(join(args[2], "new.txt"), "new file");
+      }
+      if (args[0] === "planner" && args[1].startsWith("READ ONLY revise")) {
+        revisions++;
+        prompts.push(args[1]);
+        if (scenario.includes("mutated")) {
+          writeFileSync(join(args[2], "app.txt"), "tampered");
+        }
+        if (scenario.includes("cancelled")) {
+          f.factory.cancel();
+        }
+        if (scenario.startsWith("invalid")) {
+          return { ...f.plan, verification: [] };
+        }
+        if (scenario === "reordered") {
+          return {
+            ...f.plan,
+            files: ["app.txt", "new.txt"],
+            verification: f.plan.verification.map((verification) => ({
+              purpose: verification.purpose,
+              args: verification.args,
+              command: verification.command,
+            })),
+          };
+        }
+        if (scenario === "corrected" && revisions === 2) {
+          return { ...f.plan, files: ["app.txt", "new.txt"] };
+        }
+        return {
+          ...f.plan,
+          files: ["app.txt", "new.txt"],
+          verification: [{ command: "true", args: [], purpose: "Replacement" }],
+        };
+      }
+      return run(...args);
+    };
+    await f.factory.request("change app", "local");
+    const s = f.factory.state;
+    assert.equal(revisions, scenario === "corrected" ? 2 : scenario === "exhausted" ? 3 : 1);
+    if (scenario === "corrected" || scenario === "reordered") {
+      assert.equal(s.phase, "completed", s.error);
+      if (scenario === "corrected") {
+        assert.match(present(prompts[1]), /Validation failed/);
+        assert.ok(present(prompts[1]).includes(JSON.stringify(f.plan.verification)));
+      }
+      assert.deepEqual(s.plans[1]?.verification, f.plan.verification);
+    } else {
+      assert.equal(s.phase, "blocked");
+      assert.equal(s.planRevision, 1);
+      assert.equal(s.plans.length, 1);
+      assert.equal(git(present(s.worktree), "rev-parse", "HEAD"), s.baseRevision);
+      assert.match(
+        s.error ?? "",
+        scenario === "exhausted"
+          ? /removed an existing verification/
+          : scenario.includes("mutated")
+            ? /Planner changed the candidate/
+            : scenario.includes("cancelled")
+              ? /Stop requested/
+              : /Invalid plan/,
+      );
+    }
+  });
+}
+
 test("tester mutation invalidates candidate evidence and prevents commit", async (t) => {
   const f = fixture(t);
   const run = f.factory.agents.run;

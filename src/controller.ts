@@ -458,21 +458,39 @@ export class Factory {
       }
       const snapshot = this.git.snapshot(s);
       const previous = this.planValue;
-      const revised = validatePlan(
-        await this.agent(
+      let revised: Plan | undefined;
+      let feedback = "";
+      const revise = async (attempt: number): Promise<void> => {
+        const response = await this.agent(
           "planner",
-          `READ ONLY revise scope and verification for request ${s.request}. Existing plan: ${JSON.stringify(previous)}. Changed paths: ${JSON.stringify(this.git.changed(s))}. Requested revision: ${result.scopeChange}. Include every changed path; preserve or strengthen verification. Do not edit.`,
-        ),
-      );
-      if (this.git.snapshot(s) !== snapshot) {
-        throw new Error("Planner changed the candidate during scope revision");
-      }
-      if (
-        previous.verification.some(
+          `READ ONLY revise scope and verification for request ${s.request}. Existing plan: ${JSON.stringify(previous)}. Changed paths: ${JSON.stringify(this.git.changed(s))}. Requested revision: ${result.scopeChange}. Include every changed path; preserve or strengthen verification. Do not edit.${feedback}`,
+        );
+        if (this.git.snapshot(s) !== snapshot) {
+          throw new Error("Planner changed the candidate during scope revision");
+        }
+        this.boundary();
+        const candidate = validatePlan(response);
+        const missing = previous.verification.filter(
           (old) =>
-            !revised.verification.some((next) => JSON.stringify(next) === JSON.stringify(old)),
-        )
-      ) {
+            !candidate.verification.some(
+              (next) =>
+                next.command === old.command &&
+                next.purpose === old.purpose &&
+                next.args.length === old.args.length &&
+                next.args.every((arg, index) => arg === old.args[index]),
+            ),
+        );
+        if (!missing.length) {
+          revised = candidate;
+          return;
+        }
+        feedback = `\nValidation failed: Scope revision removed an existing verification command. Restore each missing command exactly, including arguments and purpose: ${JSON.stringify(missing)}.`;
+        if (attempt < 2) {
+          await revise(attempt + 1);
+        }
+      };
+      await revise(0);
+      if (!revised) {
         throw new Error("Scope revision removed an existing verification command");
       }
       revised.tasks = previous.tasks;
@@ -533,12 +551,12 @@ export class Factory {
     }
     this.evidence("tester", result);
     let passed = result.passed;
-    for (const c of this.planValue.verification) {
-      // oxlint-disable-next-line no-await-in-loop -- Approved commands run in plan order against the same checkout.
+    await this.planValue.verification.reduce(async (previous, c) => {
+      await previous;
       if ((await this.command(c)).code !== 0) {
         passed = false;
       }
-    }
+    }, Promise.resolve());
     return passed;
   }
 
@@ -554,7 +572,8 @@ export class Factory {
     if (this.git.snapshot(s) !== s.candidateSnapshot) {
       throw new Error("Candidate changed while preparing review");
     }
-    for (const role of ["quality", "security", "ponytail"]) {
+    await ["quality", "security", "ponytail"].reduce(async (previous, role) => {
+      await previous;
       const focus =
         role === "quality"
           ? "architecture, code quality and simplicity"
@@ -562,10 +581,12 @@ export class Factory {
             ? "correctness, security, silent bugs and edge cases"
             : "the installed ponytail-review skill: independently review correctness, safety, load, tests and unnecessary code";
       let correction = "";
-      let r: { summary: string; findings: Finding[]; coverage: string[] };
-      while (true) {
-        // oxlint-disable-next-line no-await-in-loop -- Each attempt is checked and persisted before the next.
-        r = (await this.agent(
+      const review = async (): Promise<{
+        summary: string;
+        findings: Finding[];
+        coverage: string[];
+      }> => {
+        const r = (await this.agent(
           role,
           `Independent adversarial READ-ONLY review of ${s.worktree}, changes from ${s.baseRevision}. Focus on ${focus}. Read the entire review material at ${material}, using read offsets and limits to page large text, and inspect connected code. Fully inspect every changed path: ${JSON.stringify(paths)}. Plan: ${JSON.stringify(this.planValue)}. Return summary, findings with unique id, blocking boolean and concrete evidence/file paths. Coverage must contain only the exact repository-relative changed path strings, each once, with no descriptions, artifact paths or context paths; mention context separately in summary or findings. Never claim coverage of unreadable or uninspected material. No shell or edits. ${correction}`,
         )) as { summary: string; findings: Finding[]; coverage: string[] };
@@ -581,7 +602,7 @@ export class Factory {
         const missing = paths.filter((p) => !coverage.includes(p));
         const invalid = coverage.filter((p, i) => !paths.includes(p) || coverage.indexOf(p) !== i);
         if (Array.isArray(r.coverage) && !missing.length && !invalid.length) {
-          break;
+          return r;
         }
         const diagnostic = `Incomplete ${role} review coverage: expected ${JSON.stringify(paths)}; missing ${JSON.stringify(missing)}; invalid or duplicate ${JSON.stringify(invalid)}${Array.isArray(r.coverage) ? "" : "; coverage is not an array"}`;
         if (s.repairs >= 5) {
@@ -590,10 +611,12 @@ export class Factory {
         s.repairs++;
         this.save();
         correction = `Previous response was invalid: ${diagnostic}. Reinspect the material and changed paths before responding; do not invent coverage. If anything is unreadable or uninspected, omit it from coverage.`;
-      }
+        return review();
+      };
+      const r = await review();
       this.evidence(role, r);
       findings.push(...r.findings.map((f) => ({ ...f, id: role + ":" + f.id })));
-    }
+    }, Promise.resolve());
     return findings;
   }
 
@@ -652,7 +675,8 @@ export class Factory {
     ) {
       throw new Error("Incomplete triage; gate remains closed");
     }
-    for (const f of result.findings) {
+    await result.findings.reduce(async (previous, f) => {
+      await previous;
       if (f.id === "test-failure" || f.id === "docs-audit") {
         f.blocking = true;
         f.confirmed = true;
@@ -674,10 +698,9 @@ export class Factory {
         if (!c) {
           throw new Error("Reproduction command is outside the validated plan");
         }
-        // oxlint-disable-next-line no-await-in-loop -- Persist each reproduction before executing the next finding's command.
         this.evidence("reproduction", { id: f.id, result: await this.command(c) });
       }
-    }
+    }, Promise.resolve());
     s.findings = [...result.findings];
     this.evidence("triage", result);
     if (!result.complete) {
@@ -706,18 +729,18 @@ export class Factory {
     const target = JSON.stringify(s.target);
     this.running = true;
     try {
-      while (true) {
+      const step = async (): Promise<boolean> => {
         if (this.cancelWanted) {
           s.cancelled = true;
           s.paused = true;
           this.save("blocked");
-          return;
+          return false;
         }
         if (this.pauseWanted) {
           this.recordPause();
           this.pauseWanted = false;
           this.save();
-          return;
+          return false;
         }
         if (s.delivery !== delivery || JSON.stringify(s.target) !== target) {
           throw new Error("Delivery selection changed during execution");
@@ -730,11 +753,10 @@ export class Factory {
             if (task === undefined) {
               throw new Error("Task index out of range");
             }
-            // oxlint-disable-next-line no-await-in-loop -- Finish the current task checkpoint before advancing its durable index.
             await this.mutation("worker", task);
             s.task++;
             this.save();
-            continue;
+            return true;
           }
           s.step = "verify";
           this.save();
@@ -742,12 +764,9 @@ export class Factory {
           s.round++;
           s.candidateSnapshot = this.git.snapshot(s);
           this.save();
-          // oxlint-disable-next-line no-await-in-loop -- Verification must finish before reviews consume its evidence.
           const passed = await this.tests();
-          // oxlint-disable-next-line no-await-in-loop -- Reviews follow verification and finish before triage.
           const findings = await this.reviews();
           this.save("documenting");
-          // oxlint-disable-next-line no-await-in-loop -- Audit the same candidate as the other gates.
           const docs = (await this.agent(
             "docs",
             `READ ONLY audit documentation against request ${s.request} and the full implementation. Return summary and whether changes are needed. No edits or shell.`,
@@ -771,14 +790,13 @@ export class Factory {
               evidence: docs.summary,
             });
           }
-          // oxlint-disable-next-line no-await-in-loop -- Triage depends on completed tester and reviewer evidence.
           if (await this.triage(findings, passed)) {
             if (s.repairs >= 5) {
               throw new Error("Five repair cycles exhausted");
             }
             s.step = "repair";
             this.save();
-            continue;
+            return true;
           }
           s.step = "deliver";
           this.save();
@@ -786,7 +804,6 @@ export class Factory {
           this.save("repairing");
           s.repairs++;
           this.save();
-          // oxlint-disable-next-line no-await-in-loop -- Complete and checkpoint repairs before starting the next verification round.
           await this.mutation(
             "repair",
             `Repair only confirmed blocking findings: ${JSON.stringify(s.findings)}`,
@@ -798,7 +815,7 @@ export class Factory {
           this.save("delivering");
           this.finalGate();
           if (this.cancelWanted || this.pauseWanted) {
-            continue;
+            return true;
           }
           s.active = { role: "finalize", requestId: randomUUID(), started: Date.now() };
           this.save();
@@ -817,7 +834,7 @@ export class Factory {
             s.noChanges = true;
             this.save("completed");
             writeFileSync(join(this.store.dir, "report.md"), this.report(), { mode: 0o600 });
-            return;
+            return false;
           }
           s.revision = finalRevision;
           for (const evidence of s.evidence.filter((e) => e.round === s.round)) {
@@ -837,7 +854,6 @@ export class Factory {
             this.git.unchanged(s, revision);
             s.localReceipt = { revision, branch: s.branch, worktree: this.checkout(s) };
           } else {
-            // oxlint-disable-next-line no-await-in-loop -- Delivery runs only after its final gate and durable intent are recorded.
             s.pr = await this.delivery.deliver(s, this.report(), () => {
               this.boundary();
               if (s.delivery !== delivery || JSON.stringify(s.target) !== target) {
@@ -858,11 +874,14 @@ export class Factory {
             throw e;
           }
           writeFileSync(join(this.store.dir, "report.md"), this.report(), { mode: 0o600 });
-          return;
+          return false;
         } else {
           throw new Error("Unknown controller step");
         }
-      }
+        return true;
+      };
+      const runSteps = (): Promise<void> => step().then((more) => (more ? runSteps() : undefined));
+      await runSteps();
     } catch (e) {
       s.error = `Stage ${s.phase}: ${String(e)}`;
       if (this.cancelWanted) {
