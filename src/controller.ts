@@ -159,6 +159,7 @@ export class Factory {
         plans: [],
         branch: "factory/" + id,
         delivery,
+        ...(delivery === "github" ? { redDeliveryPolicy: "draft-after-repairs" as const } : {}),
         target,
         step: "implement",
         task: 0,
@@ -525,6 +526,9 @@ export class Factory {
     this.save();
     this.abort = new AbortController();
     const snapshot = this.git.snapshot(s);
+    if (snapshot !== s.candidateSnapshot) {
+      throw new Error("Candidate changed before verification command");
+    }
     const result = await execute(c.command, c.args, this.checkout(s), this.abort.signal);
     if (this.git.snapshot(s) !== snapshot) {
       throw new Error("Verification command changed the candidate; evidence invalid");
@@ -609,10 +613,10 @@ export class Factory {
           return r;
         }
         const diagnostic = `Incomplete ${role} review coverage: expected ${JSON.stringify(paths)}; missing ${JSON.stringify(missing)}; invalid or duplicate ${JSON.stringify(invalid)}${Array.isArray(r.coverage) ? "" : "; coverage is not an array"}`;
-        if (s.repairs >= 5) {
-          throw new Error(`${diagnostic}; five repair cycles exhausted`);
+        if ((s.coverageRetries ?? 0) >= 5) {
+          throw new Error(`${diagnostic}; five coverage retries exhausted`);
         }
-        s.repairs++;
+        s.coverageRetries = (s.coverageRetries ?? 0) + 1;
         this.save();
         correction = `Previous response was invalid: ${diagnostic}. Reinspect the material and changed paths before responding; do not invent coverage. If anything is unreadable or uninspected, omit it from coverage.`;
         return review();
@@ -728,8 +732,12 @@ export class Factory {
       this.save();
     }
     const p = s.planning;
-    if (p.next === "approved" || p.next === "exhausted") {
+    if (p.next === "approved") {
       this.save("implementing");
+      return;
+    }
+    if (p.next === "exhausted") {
+      this.save("blocked");
       return;
     }
     if (p.next === "blocked") {
@@ -847,6 +855,9 @@ export class Factory {
           return this.state.phase !== "blocked";
         }
         if (s.step === "implement") {
+          if (s.planning?.next !== "approved") {
+            throw new Error("Implementation requires an approved plan");
+          }
           this.save("implementing");
           if (s.task < this.planValue.tasks.length) {
             const task = this.planValue.tasks[s.task];
@@ -892,7 +903,12 @@ export class Factory {
           }
           if (await this.triage(findings, passed)) {
             if (s.repairs >= 5) {
-              throw new Error("Five repair cycles exhausted");
+              if (s.delivery !== "github" || s.redDeliveryPolicy !== "draft-after-repairs" || (s.completedRepairs ?? 0) < 5) {
+                throw new Error("Five repair cycles exhausted");
+              }
+              s.step = "deliver";
+              this.save();
+              return true;
             }
             s.step = "repair";
             this.save();
@@ -908,6 +924,7 @@ export class Factory {
             "repair",
             `Repair only confirmed blocking findings: ${JSON.stringify(s.findings)}`,
           );
+          s.completedRepairs = (s.completedRepairs ?? 0) + 1;
           s.step = "verify";
           s.documented = false;
           this.save();
@@ -931,6 +948,11 @@ export class Factory {
           const finalRevision = this.git.finalize(s, snapshot, subject);
           s.active = undefined;
           if (!finalRevision) {
+            if (!s.documented || s.findings.some((f) => f.blocking && f.confirmed)) {
+              s.error = "Verification failed and there are no changes to publish";
+              this.save("blocked");
+              return false;
+            }
             s.noChanges = true;
             this.save("completed");
             writeFileSync(join(this.store.dir, "report.md"), this.report(), { mode: 0o600 });
@@ -941,6 +963,10 @@ export class Factory {
             evidence.revision = finalRevision;
           }
           const revision = finalRevision;
+          const failed = !s.documented || s.findings.some((f) => f.blocking && f.confirmed);
+          if (failed) {
+            s.verificationVerdict = { status: "failed", revision, reason: "Quality gate failed after five repair cycles" };
+          }
           s.deliveryIntent = revision;
           this.save();
           if (s.delivery !== delivery || JSON.stringify(s.target) !== target) {
@@ -1012,8 +1038,10 @@ export class Factory {
     if (!s.candidateSnapshot || (!finalized && this.git.snapshot(s) !== s.candidateSnapshot)) {
       throw new Error("Candidate changed since verification");
     }
-    validateFinalFindings(s);
-    if (!s.documented || s.findings.some((f) => f.blocking && f.confirmed)) {
+    const red = s.delivery === "github" && s.redDeliveryPolicy === "draft-after-repairs" && (s.completedRepairs ?? 0) >= 5 &&
+      (!finalized || (s.verificationVerdict?.status === "failed" && s.verificationVerdict.revision === s.revision));
+    validateFinalFindings(s, red);
+    if (!red && (!s.documented || s.findings.some((f) => f.blocking && f.confirmed))) {
       throw new Error("Final quality gate failed");
     }
     const current = s.evidence.filter((e) => e.revision === s.revision && e.round === s.round);
@@ -1028,10 +1056,11 @@ export class Factory {
       commands.some(
         (e, i) =>
           !isRecord(e.result) ||
-          e.result.code !== 0 ||
+          typeof e.result.code !== "number" ||
+          (!red && e.result.code !== 0) ||
           JSON.stringify(e.result.command) !== JSON.stringify(this.planValue.verification[i]),
       ) ||
-      !current.some((e) => e.role === "tester" && isRecord(e.result) && e.result.passed === true)
+      !current.some((e) => e.role === "tester" && isRecord(e.result) && typeof e.result.passed === "boolean" && (red || e.result.passed === true))
     ) {
       throw new Error("Final verification did not pass");
     }

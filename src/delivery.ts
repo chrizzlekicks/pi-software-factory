@@ -10,6 +10,17 @@ function githubRepo(remote: string) {
   )?.[1];
 }
 
+export function verificationText(s: Run): string {
+  const verdict = s.verificationVerdict;
+  if (verdict) {
+    if (!s.revision || verdict.revision !== s.revision) {
+      throw new Error("Verification verdict does not match final revision");
+    }
+    return `Final revision ${s.revision}. Verification: ${verdict.status}. ${verdict.reason} Repair cycles: ${s.repairs}/5.`;
+  }
+  return `Final revision ${s.revision}. Independent tests, quality/security/Ponytail reviews, documentation audit and completion triage passed. Repair cycles: ${s.repairs}/5.`;
+}
+
 export class GitHubDelivery {
   git: Git;
   artifacts: string;
@@ -104,6 +115,7 @@ export class GitHubDelivery {
     if (!revision || !target || !worktree || !plan) {
       throw new Error("Missing GitHub delivery state");
     }
+    const verification = verificationText(s);
     this.git.unchanged(s, revision);
     if (
       this.git.git(["remote", "get-url", "origin"], worktree) !== target.remote ||
@@ -237,7 +249,7 @@ export class GitHubDelivery {
     // Execution logs can contain credentials; never publish raw agent/command output.
     writeFileSync(
       body,
-      `## Request\n${s.request}\n\n## Verification\nFinal revision ${s.revision}. Independent tests, quality/security/Ponytail reviews, documentation audit and completion triage passed. Repair cycles: ${s.repairs}/5.\n\nExecution report remains in local factory artifacts. Human review required; this is a draft.\n`,
+      `## Request\n${s.request}\n\n## Verification\n${verification}\n\nExecution report remains in local factory artifacts. Human review required; this is a draft.\n`,
       { mode: 0o600 },
     );
     boundary();

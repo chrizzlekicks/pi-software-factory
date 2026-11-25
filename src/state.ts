@@ -83,15 +83,23 @@ export type Run = {
   branch: string;
   worktree?: string;
   delivery?: "github" | "local";
+  redDeliveryPolicy?: "draft-after-repairs";
   target?: { repo: string; base: string; remote: string; baseRevision?: string } | undefined;
   step: string;
   task: number;
   repairs: number;
+  coverageRetries?: number;
+  completedRepairs?: number;
   round: number;
   documented: boolean;
   paused: boolean;
   cancelled: boolean;
   revision?: string;
+  verificationVerdict?: {
+    status: "failed" | "incomplete" | "verified";
+    revision: string;
+    reason: string;
+  };
   error?: string | undefined;
   active?: { role: string; requestId: string; started: number } | undefined;
   executions: Evidence[];
@@ -123,7 +131,7 @@ function invalidState(): never {
   throw new Error("Invalid factory state");
 }
 
-export function validateFinalFindings(s: Run) {
+export function validateFinalFindings(s: Run, allowRed = false) {
   const fail: () => never = invalidFinalFindings;
   const current = s.evidence.filter((e) => e.round === s.round && e.revision === s.revision);
   const originals: Record<string, unknown>[] = [];
@@ -167,8 +175,11 @@ export function validateFinalFindings(s: Run) {
     fail();
   }
   const audits = current.filter((e) => e.role === "docs");
-  if (audits.length !== 1 || !isRecord(audits[0]?.result) || audits[0].result.changes !== false) {
+  if (audits.length !== 1 || !isRecord(audits[0]?.result) || typeof audits[0].result.changes !== "boolean" || (!allowRed && audits[0].result.changes !== false)) {
     fail();
+  }
+  if (audits[0].result.changes === true) {
+    originals.push({ id: "docs-audit", blocking: true, confirmed: true, evidence: audits[0].result.summary });
   }
   const triages = current.filter((e) => e.role === "triage");
   if (triages.length !== 1) {
@@ -178,16 +189,22 @@ export function validateFinalFindings(s: Run) {
   const findings: unknown = isRecord(triage) ? triage.findings : undefined;
   if (
     !isRecord(triage) ||
-    triage.complete !== true ||
+    (triage.complete !== true && !(allowRed && triage.complete === false)) ||
     !text(triage.completionEvidence) ||
     !Array.isArray(findings) ||
     findings.length > MAX_TRIAGE_FINDINGS ||
     findings.length !== originals.length ||
     findings.some((f: unknown) => !isRecord(f)) ||
     new Set(findings.filter(isRecord).map((f) => f.id)).size !== originals.length ||
-    s.findings.length !== findings.length
+    s.findings.length !== findings.length + (triage.complete === false ? 1 : 0)
   ) {
     fail();
+  }
+  if (triage.complete === false) {
+    const incomplete = s.findings.filter((f) => f.id === "task-incomplete");
+    if (incomplete.length !== 1 || incomplete[0]?.blocking !== true || incomplete[0]?.confirmed !== true || incomplete[0]?.evidence !== triage.completionEvidence || incomplete[0]?.reproduction !== undefined || originals.some((f) => f.id === "task-incomplete")) {
+      fail();
+    }
   }
   for (const original of originals) {
     const f: unknown = findings.find((x: unknown) => isRecord(x) && x.id === original.id);
@@ -198,7 +215,7 @@ export function validateFinalFindings(s: Run) {
       typeof f.confirmed !== "boolean" ||
       (original.id === "test-failure" && (!f.confirmed || !f.blocking)) ||
       (original.blocking && f.confirmed && !f.blocking) ||
-      (f.confirmed && f.blocking) ||
+      (!allowRed && f.confirmed && f.blocking) ||
       f.blocking !== saved.blocking ||
       f.confirmed !== saved.confirmed ||
       f.evidence !== saved.evidence ||
@@ -316,6 +333,8 @@ function validateRunFields(s: unknown): asserts s is Run {
   if (
     !integer(s.task) ||
     !integer(s.repairs) ||
+    (s.coverageRetries !== undefined && (!integer(s.coverageRetries) || s.coverageRetries > 5)) ||
+    (s.completedRepairs !== undefined && (!integer(s.completedRepairs) || s.completedRepairs > s.repairs)) ||
     s.repairs > 5 ||
     !integer(s.round) ||
     !integer(s.updated) ||
@@ -324,6 +343,16 @@ function validateRunFields(s: unknown): asserts s is Run {
     !optionalText(s.revision) ||
     !optionalText(s.error) ||
     !optionalText(s.deliveryIntent)
+  ) {
+    fail();
+  }
+  if (
+    s.verificationVerdict !== undefined &&
+    (!isRecord(s.verificationVerdict) ||
+      !["failed", "incomplete", "verified"].includes(String(s.verificationVerdict.status)) ||
+      !text(s.verificationVerdict.revision) ||
+      s.verificationVerdict.revision !== s.revision ||
+      !text(s.verificationVerdict.reason))
   ) {
     fail();
   }
@@ -528,7 +557,8 @@ export function validateRun(s: unknown): asserts s is Run {
   validateRunFields(s);
   const fail: () => never = invalidState;
   if (s.step === "deliver") {
-    validateFinalFindings(s);
+    const red = s.delivery === "github" && s.redDeliveryPolicy === "draft-after-repairs" && (s.completedRepairs ?? 0) >= 5;
+    validateFinalFindings(s, red);
     const current = s.evidence.filter(
       (e: Evidence) => e.round === s.round && e.revision === s.revision,
     );
@@ -543,11 +573,12 @@ export function validateRun(s: unknown): asserts s is Run {
       commands.some(
         (e: Evidence, i: number) =>
           !isRecord(e.result) ||
-          e.result.code !== 0 ||
+          typeof e.result.code !== "number" ||
+          (!red && e.result.code !== 0) ||
           JSON.stringify(e.result.command) !== JSON.stringify(expected[i]),
       ) ||
       !current.some(
-        (e: Evidence) => e.role === "tester" && isRecord(e.result) && e.result.passed === true,
+        (e: Evidence) => e.role === "tester" && isRecord(e.result) && typeof e.result.passed === "boolean" && (red || e.result.passed === true),
       ) ||
       ["quality", "security", "ponytail"].some(
         (role) => !current.some((e: Evidence) => e.role === role),

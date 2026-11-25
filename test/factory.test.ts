@@ -243,7 +243,7 @@ test("planning rejection revises and rereviews before worker dispatch", async (t
   );
 });
 
-test("planning third rejection proceeds with unresolved findings", async (t) => {
+test("planning third rejection blocks with unresolved findings", async (t) => {
   const f = fixture(t);
   const run = f.factory.agents.run;
   const prompts: string[] = [];
@@ -258,9 +258,9 @@ test("planning third rejection proceeds with unresolved findings", async (t) => 
     return run(...args);
   };
   await f.factory.request("change app", "local");
-  assert.equal(f.store.state?.phase, "completed", f.store.state?.error);
+  assert.equal(f.store.state?.phase, "blocked", f.store.state?.error);
   assert.deepEqual(f.store.state?.planning?.unresolved, ["Missing verification"]);
-  assert.ok(prompts.length > 1 && prompts.every((p) => p.includes("Missing verification")));
+  assert.deepEqual(prompts, []);
   assert.deepEqual(f.calls.slice(0, 6), [
     "planner",
     "challenger",
@@ -481,7 +481,8 @@ test("malformed descriptive coverage is corrected by a fresh review within the s
   await f.factory.request("change README", "local");
   const s = f.factory.state;
   assert.equal(s.phase, "completed", s.error);
-  assert.equal(s.repairs, 1);
+  assert.equal(s.repairs, 0);
+  assert.equal(s.coverageRetries, 1);
   assert.equal(f.repairs(), 0);
   assert.equal(git(present(s.worktree), "rev-list", "--count", `${s.baseRevision}..HEAD`), "1");
 });
@@ -504,7 +505,8 @@ test("repeated malformed coverage exhausts the shared budget and reports the fai
   await f.factory.request("change app", "local");
   const s = f.factory.state;
   assert.equal(s.phase, "blocked");
-  assert.equal(s.repairs, 5);
+  assert.equal(s.repairs, 0);
+  assert.equal(s.coverageRetries, 5);
   assert.equal(attempts, 6);
   assert.equal(f.repairs(), 0);
   assert.match(s.error ?? "", /expected \["app.txt"\]; missing \["app.txt"\]; invalid/);
@@ -874,9 +876,9 @@ test("autonomous GitHub lifecycle binds final evidence to the final revision", a
   ]);
 });
 
-test("failures trigger two repairs, then block", async (t) => {
+test("local failures exhaust five repairs, then block", async (t) => {
   const f = fixture(t, 99);
-  await f.factory.plan("change", "github");
+  await f.factory.plan("change", "local");
   await f.factory.drive();
   assert.equal(f.repairs(), 5);
   assert.equal(f.store.state?.phase, "blocked");
@@ -945,7 +947,7 @@ test("pause and resume preserve a runnable autonomous plan", async (t) => {
 test("approved command failure blocks delivery even if tester claims success", async (t) => {
   const f = fixture(t);
   present(f.plan.verification[0]).args = ["-e", "process.exit(1)"];
-  await f.factory.plan("change", "github");
+  await f.factory.plan("change", "local");
   await f.factory.drive();
   assert.equal(present(f.store.state).phase, "blocked");
   assert.equal(present(f.store.state).pr, undefined);
@@ -1160,7 +1162,7 @@ test("blocked quality gate preserves repair count and cannot resume", async (t) 
 
 test("exhausted quality gate cannot resume or bypass verification", async (t) => {
   const f = fixture(t, 99);
-  await f.factory.request("change", "github");
+  await f.factory.request("change", "local");
   const s = f.factory.state;
   assert.equal(s.phase, "blocked");
   assert.equal(s.repairs, 5);
@@ -2441,9 +2443,9 @@ else if(a[0]==='pr'&&a[1]==='view') console.log(fs.readFileSync(file,'utf8')); e
   assert.equal(JSON.parse(readFileSync(prFile, "utf8")).baseRefName, "main");
 });
 
-test("delivery-only reconciles local remote and interrupted PR creation without duplicate", async (t) => {
+test("red draft after five repairs retries exact delivery without duplicate", async (t) => {
   const { chmodSync } = await import("node:fs");
-  const f = fixture(t);
+  const f = fixture(t, 99);
   const bare = join(f.root, "remote.git");
   git(f.root, "init", "--bare", bare);
   git(f.repo, "remote", "add", "origin", "https://github.com/example/repo.git");
@@ -2507,6 +2509,10 @@ else if(a[0]==='pr'&&a[1]==='view') console.log(fs.readFileSync(file,'utf8')); e
   f.factory.delivery = new PreflightDelivery(f.factory.git, f.store.dir);
   const s = f.factory.state,
     calls = [...f.calls];
+  assert.equal(s.phase, "blocked");
+  assert.equal(f.repairs(), 5);
+  assert.equal(s.verificationVerdict?.status, "failed");
+  const revision = s.revision;
   process.env.TEST_RETRY_PUSH_FAIL = "1";
   await assert.rejects(f.factory.deliver(), /Push failed/);
   delete process.env.TEST_RETRY_PUSH_FAIL;
@@ -2566,6 +2572,8 @@ else if(a[0]==='pr'&&a[1]==='view') console.log(fs.readFileSync(file,'utf8')); e
     assert.equal(readFileSync(log, "utf8").split("create\n").length - 1, 2);
     assert.equal(readFileSync(log, "utf8").split("push\n").length - 1, 2);
     assert.deepEqual(f.calls, calls);
+    assert.equal(factory.state.revision, revision);
+    assert.equal(factory.state.verificationVerdict?.status, "failed");
     assert.equal(git(present(s.worktree), "rev-list", "--count", `${s.baseRevision}..HEAD`), "1");
   } finally {
     reopened.close();
@@ -2872,8 +2880,15 @@ test("persisted planning boundaries resume without replaying completed reviews",
         await factory.resume();
         await factory.drive();
         if (boundary === "exhausted") {
-          assert.equal(factory.state.phase, "completed", factory.state.error);
-          assert.ok(f.calls.includes("worker"));
+          assert.equal(factory.state.phase, "blocked", factory.state.error);
+          assert.deepEqual(f.calls, ["planner"]);
+          assert.equal(factory.state.revision, factory.state.baseRevision);
+          assert.equal(factory.state.localReceipt, undefined);
+          assert.equal(factory.state.pr, undefined);
+          assert.equal(readFileSync(join(present(factory.state.worktree), "app.txt"), "utf8"), "old");
+          await assert.rejects(factory.resume(), /blocked/i);
+          await assert.rejects(factory.drive(), /not runnable/i);
+          assert.deepEqual(f.calls, ["planner"]);
         } else {
           assert.equal(factory.state.phase, "completed", factory.state.error);
           assert.equal(
@@ -2954,4 +2969,50 @@ test("planning completion interruption and pause retain uncertain active operati
       });
     }
   }
+});
+
+
+test("coverage retry leaves five actual repairs available", async (t) => {
+  const f = fixture(t, 99);
+  const run = f.factory.agents.run;
+  let first = true;
+  f.factory.agents.run = async (...args) => {
+    if (args[0] === "quality" && first) {
+      first = false;
+      return { summary: "Incomplete", findings: [], coverage: [] };
+    }
+    return run(...args);
+  };
+  await f.factory.request("change app", "local");
+  assert.equal(f.factory.state.coverageRetries, 1);
+  assert.equal(f.repairs(), 5);
+  assert.equal(f.factory.state.phase, "blocked");
+});
+
+test("red no-op blocks instead of reporting success", async (t) => {
+  const f = fixture(t, 99);
+  const run = f.factory.agents.run;
+  f.factory.agents.run = async (...args) => {
+    if (args[0] === "worker" || args[0] === "repair") return { summary: "No changes", scopeChange: "" };
+    return run(...args);
+  };
+  await f.factory.request("change app", "github");
+  assert.equal(f.factory.state.phase, "blocked");
+  assert.match(f.factory.state.error ?? "", /Verification failed and there are no changes to publish/);
+  assert.notEqual(f.factory.state.noChanges, true);
+  assert.equal(f.factory.state.deliveryIntent, undefined);
+});
+
+test("incomplete triage after five repairs delivers red draft", async (t) => {
+  const f = fixture(t);
+  const run = f.factory.agents.run;
+  f.factory.agents.run = async (...args) => {
+    if (args[0] === "triage") return { findings: [], complete: false, completionEvidence: "Missing behavior", commitSubject: "fix: update app" };
+    return run(...args);
+  };
+  await f.factory.request("change app", "github");
+  assert.equal(f.factory.state.phase, "completed", f.factory.state.error);
+  assert.equal(f.repairs(), 5);
+  assert.equal(f.factory.state.verificationVerdict?.status, "failed");
+  assert.equal(f.factory.state.pr?.draft, true);
 });

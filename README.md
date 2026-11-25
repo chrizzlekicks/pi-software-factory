@@ -22,6 +22,8 @@ In Pi, submit a request with `/factory <description>`. Delivery is GitHub for gi
 
 The factory creates an isolated worktree and `factory/...` branch from committed HEAD, excluding changes in the original checkout. It runs tests, three independent reviews, a documentation audit and completion triage, with up to five shared repair rounds. Passing changes receive one final commit with a validated Conventional Commits subject based on the verified changes; an already-satisfied request needs no commit. GitHub mode pushes a new branch and opens a draft PR against the repository default branch recorded at preflight. The PR can include local commits not present on that base; review its full diff. local mode does not push or create a PR. Worktrees are retained.
 
+If quality gates still fail after five repairs, GitHub mode may deliver the finalized candidate as a draft PR with a failed verification verdict; it is not a passing result and needs human review. Local mode blocks instead. Delivery failures retain the finalized candidate for an explicit delivery-only retry; the retry must reconcile that exact revision and does not rerun verification or repair.
+
 ## Controls and recovery
 
 - `/factory` and `/factory status` show progress and evidence. Control commands are recognized only when the entire trimmed input matches; extra words make it a description. `request` is not an alias and remains part of the description.
